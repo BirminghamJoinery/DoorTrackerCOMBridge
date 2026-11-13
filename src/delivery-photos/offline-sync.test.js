@@ -89,18 +89,23 @@ function call(service, { method, path, token, body, headers = {} }) {
 // The same three calls app.js makes, over a real HTTPS connection.
 function iPadApi(service, getToken) {
   return {
+    // Mirrors app.js's checkService(): nothing answering is "unreachable"; an
+    // HTTP error is an answer (reachable, ok: false) with its status.
     async checkService() {
       const res = await call(service, { method: 'GET', path: '/api/pair/check', token: getToken() });
-      if (res.status !== 200) return { reachable: false, paired: false };
+      const url = `https://localhost:${service.port}/api/pair/check`;
+      const authState = getToken() ? 'present' : 'missing';
+      if (res.status === 0) return { reachable: false, paired: false, kind: 'unreachable', reason: `Could not connect to localhost:${service.port}`, url, authState };
+      if (res.status !== 200) return { reachable: true, ok: false, paired: false, status: res.status, kind: Queue.classifyHttpStatus(res.status), url, authState };
       const paired = Boolean(getToken() && res.data.paired);
-      return { reachable: true, paired, role: paired ? res.data.role : null };
+      return { reachable: true, ok: true, paired, role: paired ? res.data.role : null, status: 200, url, authState };
     },
     async uploadPhoto({ role, code, photoId, bytes, sha256 }) {
       const headers = { 'Content-Type': 'image/jpeg', 'X-Photo-Sha256': sha256, ...(role ? { 'X-Photo-Role': role } : {}) };
       const res = await call(service, { method: 'PUT', path: `/api/photos/${encodeURIComponent(code)}/${photoId}`, token: getToken(), body: Buffer.from(bytes), headers });
       if (res.status === 0) return { ok: false, unreachable: true, error: 'Could not reach the Delivery Photos service on this PC.' };
       if (res.status >= 200 && res.status < 300) return { ok: true, status: res.status, data: res.data };
-      return { ok: false, status: res.status, error: res.data.message || `HTTP ${res.status}`, needsPairing: res.status === 401, wrongRole: res.status === 403 };
+      return { ok: false, status: res.status, kind: Queue.classifyHttpStatus(res.status), error: res.data.message || `HTTP ${res.status}`, needsPairing: res.status === 401, wrongRole: res.status === 403 };
     },
     async completeSession({ sessionId, role, code, photosSaved }) {
       const res = await call(service, { method: 'POST', path: '/api/photo-sessions/complete', token: getToken(), body: Buffer.from(JSON.stringify({ sessionId, code, photosSaved })), headers: { 'Content-Type': 'application/json', 'X-Photo-Role': role } });
@@ -167,7 +172,7 @@ test('away from the workshop: deliveries queue on the iPad, nothing is filed or 
     await service.start();
     const before = Date.now();
     const online = await engine.syncAll();
-    assert.deepEqual(online, { outcome: 'done', sent: 4, failed: 0 });
+    assert.deepEqual(online, { outcome: 'done', sent: 4, failed: 0, deferred: 0 });
 
     // Full, part 1 and part 2 of order 5698 all file into folder 5698, numbered in send order.
     assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg', '002-DELIV.jpg', '003-DELIV.jpg', '004-DELIV.jpg', '005-DELIV.jpg', '006-DELIV.jpg']);
@@ -203,7 +208,7 @@ test('a crash after the PC filed a photo but before the iPad noted it: the re-se
     await store.updateSession(session.sessionId, { status: Queue.STATUS.SYNCING }); // left mid-sync
 
     const result = await engine.syncAll();
-    assert.deepEqual(result, { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(result, { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
     assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg', '002-DELIV.jpg', '003-DELIV.jpg'], 'three photos, three files, three numbers - none filed twice');
     assert.equal(listPendingEvents(service.queueDir).length, 1);
   } finally {
@@ -261,7 +266,7 @@ test('pairing reset on the PC: nothing is sent or deleted; after pairing again e
 
     token.value = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token; // paired again
     const after = await engine.syncAll();
-    assert.deepEqual(after, { outcome: 'done', sent: 2, failed: 0 });
+    assert.deepEqual(after, { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
     assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg', '002-DELIV.jpg']);
     assert.equal(countOrdersFiledOn(service.filedLogDir), 2);
   } finally {
@@ -282,7 +287,7 @@ test('one photo the PC cannot accept: the session stays queued, no tracking even
     const session = await queueSession(store, '5698-DELIV', photos);
 
     const result = await engine.syncAll();
-    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1 });
+    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
     const record = await store.getSession(session.sessionId);
     assert.equal(record.status, Queue.STATUS.FAILED);
     assert.match(record.lastError, /JPEG/);
@@ -304,13 +309,13 @@ test('the company drive unavailable: photos stay on the iPad and are sent once i
     await service.start();
     const session = await queueSession(store, '5698-DELIV', shots(2, 'drive'));
     const result = await engine.syncAll();
-    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1 });
+    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
     assert.equal((await store.getSession(session.sessionId)).status, Queue.STATUS.FAILED);
     assert.deepEqual(listPendingEvents(service.queueDir), []);
 
     fs.mkdirSync(missing); // the drive is reconnected
     const retry = await engine.syncAll();
-    assert.deepEqual(retry, { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(retry, { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
     assert.deepEqual(fs.readdirSync(nodePath.join(missing, '5698')).sort(), ['001-DELIV.jpg', '002-DELIV.jpg']);
   } finally {
     await service.stop();
@@ -351,12 +356,12 @@ test('all three roles offline: queued apart from the PC, then filed into the rig
     assert.deepEqual([queuedBench.role, queuedBench.code, queuedBench.baseOrder, queuedBench.photoCount], ['bench', '5626-2-D', '5626-2', 2]);
 
     await service.start();
-    assert.deepEqual(await deliveryEngine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(await deliveryEngine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
     // Order 5626-2 already has one delivery photo when the Bench iPad sends.
     fs.mkdirSync(nodePath.join(env.share, '5626-2'));
     fs.writeFileSync(nodePath.join(env.share, '5626-2', '001-DELIV.jpg'), 'earlier delivery photo');
-    assert.deepEqual(await bench.engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
-    assert.deepEqual(await irn.engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(await bench.engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
+    assert.deepEqual(await irn.engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
 
     assert.deepEqual(filesIn(env, '5698'), ['001-BENCH.jpg', '002-DELIV.jpg', '003-DELIV.jpg']);
     assert.deepEqual(filesIn(env, '5626-2'), ['001-DELIV.jpg', '002-BENCH.jpg', '003-BENCH.jpg', '004-IRN.jpg']);
@@ -386,7 +391,7 @@ test('a queued record edited to claim another role gains nothing: the PC files b
     // Someone edits the queued record on the iPad to pose as a Delivery.
     await store.updateSession(session.sessionId, { role: 'delivery', code: '5698-DELIV', reference: '5698-DELIV' });
     const result = await engine.syncAll();
-    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1 });
+    assert.deepEqual(result, { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
     assert.equal((await store.getSession(session.sessionId)).status, Queue.STATUS.WRONG_ROLE, 'the iPad itself will not send it as another role');
 
     // And sending it directly, bypassing the iPad's own checks, is refused by the PC every way round.
@@ -403,7 +408,7 @@ test('a queued record edited to claim another role gains nothing: the PC files b
 
     // Restored to what it really was, it files as -BENCH, under the token's role.
     await store.updateSession(session.sessionId, { role: 'bench', code: '5698-D', reference: '' });
-    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
     assert.deepEqual(filesIn(env, '5698'), ['001-BENCH.jpg']);
   } finally {
     await service.stop();
@@ -421,7 +426,7 @@ test('re-paired as a different role while photos were queued: they are kept, not
     service.pairing.revokeAll();
     token.value = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
 
-    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 0, failed: 1 });
+    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
     const [kept] = await store.listSessions();
     assert.equal(kept.status, Queue.STATUS.WRONG_ROLE);
     assert.equal((await store.getPhotos(kept.sessionId)).length, 2);
@@ -429,9 +434,187 @@ test('re-paired as a different role while photos were queued: they are kept, not
 
     service.pairing.revokeAll();
     token.value = service.pairing.pair(service.pairing.generateCode({ role: 'ironmongery' }).code).token;
-    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
     assert.deepEqual(filesIn(env, '5626-2'), ['001-IRN.jpg', '002-IRN.jpg']);
     assert.deepEqual(listPendingEvents(service.queueDir), []);
+  } finally {
+    await service.stop();
+    store.close();
+    env.cleanup();
+  }
+});
+
+// ---- "SEND PENDING NOW does nothing": the real Photo Service -----------------
+
+// Writes records straight into the iPad's IndexedDB, as an older version of
+// the tool (or a damaged record) would have left them.
+function writeRaw(indexedDB, sessions, photos) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(Queue.DB_NAME);
+    open.onsuccess = () => {
+      const tx = open.result.transaction(['sessions', 'photos'], 'readwrite');
+      for (const s of sessions) tx.objectStore('sessions').put(s);
+      for (const p of photos) tx.objectStore('photos').put(p);
+      tx.oncomplete = () => {
+        open.result.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+    open.onerror = () => reject(open.error);
+  });
+}
+
+test('reachable PC + valid current token: Send sends every pending delivery, and each step is logged', async () => {
+  const env = makeEnv();
+  const service = makeService(env);
+  const token = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+  const store = await Queue.openStore({ indexedDB: new IDBFactory() });
+  const log = [];
+  const engine = Queue.createSyncEngine({ store, api: iPadApi(service, () => token), log: (event, details) => log.push({ event, ...details }) });
+  try {
+    await queueSession(store, '5698-DELIV', shots(2, 'a'));
+    await queueSession(store, '5701-DELIV', shots(1, 'b'));
+    await service.start();
+    const result = await engine.syncAll({ reason: 'button' });
+    assert.deepEqual(result, { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
+    assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg', '002-DELIV.jpg']);
+    const health = log.find((l) => l.event === 'health');
+    assert.deepEqual([health.reachable, health.paired, health.status, health.auth, health.url], [true, true, 200, 'present', `https://localhost:${service.port}/api/pair/check`]);
+    assert.deepEqual(log.filter((l) => l.event === 'upload-result').map((l) => l.status), [201, 201, 201]);
+    assert.equal(log.at(-1).event, 'sync-end');
+    assert.doesNotMatch(JSON.stringify(log), new RegExp(token), 'the token is never logged');
+  } finally {
+    await service.stop();
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('reachable PC + expired/invalid token: nothing sent or deleted, the reason is "Pairing required" / "Authentication failed", and re-pairing sends it all', async () => {
+  const env = makeEnv();
+  const service = makeService(env);
+  const token = { value: 'an-old-token-from-before-pairing-was-reset' };
+  const store = await Queue.openStore({ indexedDB: new IDBFactory() });
+  const api = iPadApi(service, () => token.value);
+  const engine = Queue.createSyncEngine({ store, api });
+  try {
+    await service.start();
+    await queueSession(store, '5698-DELIV', shots(1, 'a'));
+    await queueSession(store, '5701-DELIV', shots(1, 'b'));
+
+    // 1. The check itself says this token is not paired.
+    const blocked = await engine.syncAll();
+    assert.deepEqual([blocked.outcome, blocked.kind], ['needs_pairing', 'pairing']);
+    assert.match(blocked.reason, /no longer recognises this iPad's pairing/);
+    let sessions = await store.listSessions();
+    assert.equal(sessions.length, 2);
+    assert.ok(sessions.every((s) => s.status === Queue.STATUS.NEEDS_PAIRING && s.lastErrorKind === 'pairing'));
+
+    // 2. Valid at the check, revoked a moment later: the upload's 401 stops
+    //    sending at once and is shown as an authentication failure.
+    token.value = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+    const revokingApi = { ...api, checkService: async () => { const r = await api.checkService(); service.pairing.revokeAll(); return r; } };
+    const midway = await Queue.createSyncEngine({ store, api: revokingApi }).syncAll();
+    assert.equal(midway.outcome, 'needs_pairing');
+    const first = (await store.listSessions())[0];
+    assert.deepEqual([first.status, first.lastErrorKind, first.lastHttpStatus], [Queue.STATUS.NEEDS_PAIRING, 'auth', 401]);
+    assert.equal(Queue.failureLabel(first.lastErrorKind), 'Authentication failed');
+    assert.deepEqual(filesIn(env, '5698'), []);
+
+    // 3. Paired again: everything goes.
+    token.value = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
+    sessions = await store.listSessions();
+    assert.deepEqual(sessions, []);
+  } finally {
+    await service.stop();
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('sessions queued by the first offline version (old record format) are filed by the real PC', async () => {
+  const env = makeEnv();
+  const service = makeService(env);
+  const token = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+  const indexedDB = new IDBFactory();
+  const store = await Queue.openStore({ indexedDB });
+  const engine = Queue.createSyncEngine({ store, api: iPadApi(service, () => token) });
+  try {
+    const sessionId = randomUUID();
+    const [photo] = shots(1, 'old');
+    const sha256 = await Queue.sha256Hex(photo.bytes);
+    // Exactly the fields that version wrote: no role, no code, no baseOrder.
+    await writeRaw(indexedDB, [{ sessionId, reference: '5698-P2-DELIV', orderNumber: '5698', deliveryType: 'Part Delivery', partNo: 2, photoCount: 1, totalBytes: photo.bytes.byteLength, capturedAt: '2026-10-01T09:00:00.000Z', createdAt: '2026-10-01T09:00:01.000Z', queueOrder: 1, status: 'syncing', attempts: 3, lastAttemptAt: '2026-10-01T09:05:00.000Z', lastError: '' }], [{ photoId: photo.photoId, sessionId, position: 0, bytes: photo.bytes, sizeBytes: photo.bytes.byteLength, sha256, width: 1, height: 1, capturedAt: '2026-10-01T09:00:00.000Z', uploaded: false, uploadedAt: '' }]);
+    await service.start();
+    assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
+    assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg']);
+    const [event] = listPendingEvents(service.queueDir);
+    assert.deepEqual([event.reference, event.deliveryType, event.partNo, event.eventId], ['5698-P2-DELIV', 'Part Delivery', 2, sessionId]);
+  } finally {
+    await service.stop();
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('the first queued session fails (damaged record, then refused photo) but the valid ones behind it are filed', async () => {
+  const env = makeEnv();
+  const service = makeService(env);
+  const token = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+  const indexedDB = new IDBFactory();
+  const store = await Queue.openStore({ indexedDB });
+  const engine = Queue.createSyncEngine({ store, api: iPadApi(service, () => token) });
+  try {
+    // 1st (oldest): its photo record lost its data.
+    const damagedId = randomUUID();
+    const [lost] = shots(1, 'lost');
+    await writeRaw(indexedDB, [{ sessionId: damagedId, role: 'delivery', code: '5600-DELIV', reference: '5600-DELIV', orderNumber: '5600', baseOrder: '5600', deliveryType: 'Full Delivery', partNo: '', photoCount: 1, totalBytes: 0, capturedAt: '2026-10-01T08:00:00.000Z', createdAt: '2026-10-01T08:00:00.000Z', queueOrder: 1, status: 'pending', attempts: 0, lastAttemptAt: '', lastError: '' }], [{ photoId: lost.photoId, sessionId: damagedId, position: 0, bytes: null, sizeBytes: 0, sha256: '', width: 0, height: 0, capturedAt: '2026-10-01T08:00:00.000Z', uploaded: false, uploadedAt: '' }]);
+    // 2nd: a photo the PC refuses (not a JPEG).
+    const refusedShots = shots(1, 'refused');
+    refusedShots[0] = { ...refusedShots[0], bytes: toArrayBuffer(Buffer.alloc(4000, 7)) };
+    const refused = await queueSession(store, '5601-DELIV', refusedShots);
+    // 3rd and 4th: perfectly good.
+    await queueSession(store, '5698-DELIV', shots(2, 'good'));
+    await queueSession(store, '5701-DELIV', shots(1, 'good2'));
+
+    await service.start();
+    const result = await engine.syncAll();
+    assert.deepEqual(result, { outcome: 'done', sent: 2, failed: 2, deferred: 0 });
+    assert.deepEqual(filesIn(env, '5698'), ['001-DELIV.jpg', '002-DELIV.jpg']);
+    assert.deepEqual(filesIn(env, '5701'), ['001-DELIV.jpg']);
+    const left = Object.fromEntries((await store.listSessions()).map((s) => [s.sessionId, s]));
+    assert.deepEqual(Object.keys(left).sort(), [damagedId, refused.sessionId].sort(), 'both failures kept on the iPad');
+    assert.equal(left[damagedId].lastErrorKind, 'format');
+    assert.match(left[damagedId].lastError, /Session format invalid/);
+    assert.deepEqual([left[refused.sessionId].lastErrorKind, left[refused.sessionId].lastHttpStatus], ['rejected', 400]);
+    assert.match(left[refused.sessionId].lastError, /JPEG/);
+  } finally {
+    await service.stop();
+    store.close();
+    env.cleanup();
+  }
+});
+
+test('the PC is reachable but its check fails with a server error: shown as "Server returned 500", nothing marked unpaired', async () => {
+  const env = makeEnv();
+  const service = makeService(env);
+  const token = service.pairing.pair(service.pairing.generateCode({ role: 'delivery' }).code).token;
+  const store = await Queue.openStore({ indexedDB: new IDBFactory() });
+  const realVerify = service.pairing.verify.bind(service.pairing);
+  try {
+    await service.start();
+    await queueSession(store, '5698-DELIV', shots(1, 'x'));
+    service.pairing.verify = () => {
+      throw new Error('devices file unreadable');
+    };
+    const engine = Queue.createSyncEngine({ store, api: iPadApi(service, () => token) });
+    const result = await engine.syncAll();
+    assert.deepEqual([result.outcome, result.status, result.reason], ['service_error', 500, 'Server returned 500']);
+    assert.equal((await store.listSessions())[0].status, Queue.STATUS.PENDING);
+    service.pairing.verify = realVerify;
+    assert.equal((await engine.syncAll()).sent, 1);
   } finally {
     await service.stop();
     store.close();

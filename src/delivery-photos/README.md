@@ -44,6 +44,39 @@ program carries a small responder (`mdns.js`, via `bonjour-service`) so nothing
 else has to be installed on the PC. iPadOS resolves `.local` names natively,
 so the iPad needs nothing extra either.
 
+It advertises only the PC's real LAN IPv4 address(es) - never loopback,
+link-local (169.254.x.x), IPv6, or adapters that look virtual (Hyper-V/WSL
+`vEthernet`, VirtualBox, VMware, VPNs) unless there is nothing else - and
+re-announces within 30 seconds if the PC's addresses change. Each set it
+advertises is written to the Delivery Photos log ("Advertising
+door-tracker.local on the local network as 192.168.1.20").
+
+## When pending photos will not send
+
+The iPad tool only ever talks to the address it was opened from - normally
+`https://<hostname>.local:<port>/`, the address shown in the Windows app.
+Its pending photos and its pairing are stored by the browser **for that
+address only**. Reaching the PC at its IP address (`https://192.168.1.20:<port>/`)
+in Safari proves the PC is up, but it is a different site to the browser: it
+cannot see, or send, the Home Screen app's pending photos.
+
+The Pending screen says what is actually wrong for each delivery (Photo
+Service unreachable, Upload timed out, Authentication failed, Pairing
+required, Session format invalid, Network drive unavailable, Server returned
+500...), **SEND PENDING NOW** always shows a result line, and **Sending
+diagnostics** at the bottom shows the tool's address, whether a pairing is
+saved, the last check, and a log of every send step (never the pairing token
+or photo data).
+
+To check the name from the iPad, open
+`https://<hostname>.local:<port>/api/health` in Safari. If that fails but
+`https://<IP>:<port>/api/health` answers, the `.local` name is not resolving on
+this network: compare the address in the Delivery Photos log's "Advertising
+..." line with the IP that works, and check Windows Firewall allows the app
+on Private networks (mDNS uses UDP port 5353). **Never** delete the Home
+Screen app or clear Safari's website data to "fix" this - that deletes the
+pending photos.
+
 ## Data Matrix and QR Code scanning
 
 Safari on iOS has no `BarcodeDetector` API at all. Scanning

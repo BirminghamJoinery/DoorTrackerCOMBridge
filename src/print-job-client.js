@@ -98,4 +98,26 @@ async function reprintJob(apiBase, jobId) {
   return { ok: true, job: result.data && result.data.printJob };
 }
 
-module.exports = { deriveApiBase, reportJobStatus, fetchPendingJobs, reprintJob };
+// Asks the website to create an order's normal label job — see
+// POST /api/print-jobs/order in the website project, which builds it with
+// the same profile/labels/PRINT_JOBS row as every other label job. Used only
+// by General Door Code Printing (general-door-trigger.js); the returned job
+// goes to the same print-job processor as every other job.
+async function createOrderLabelJob(apiBase, { order, stationKey, device, source }) {
+  if (!apiBase) return { ok: false, error: 'No API URL configured.' };
+
+  const result = await fetchJson(`${apiBase}/api/print-jobs/order`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order, station_key: stationKey, device, source })
+  });
+
+  if (!result.ok) {
+    return { ok: false, error: result.error };
+  }
+  const job = result.data && result.data.printJob;
+  if (!job || !job.jobId) return { ok: false, error: 'The website did not return a print job.' };
+  return { ok: true, job };
+}
+
+module.exports = { deriveApiBase, reportJobStatus, fetchPendingJobs, reprintJob, createOrderLabelJob };

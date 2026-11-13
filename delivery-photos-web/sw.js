@@ -60,3 +60,12 @@ self.addEventListener('fetch', (event) => {
     })()
   );
 });
+
+// Lets the open page ask which version of the offline copy it was loaded
+// from, so it can tell when the PC has a newer one and offer a reload (see
+// app.js's checkAppVersion). Answers with the version stamp only.
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'get-version' && event.ports && event.ports[0]) {
+    event.ports[0].postMessage({ version: VERSION });
+  }
+});

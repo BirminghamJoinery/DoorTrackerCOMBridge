@@ -69,3 +69,52 @@ test('a real mDNS query for the advertised hostname gets a real answer', async (
     await handle.stop();
   }
 });
+
+// ---- Which addresses ".local" resolves to (no network needed) ---------------
+
+const { lanAddresses } = require('./mdns');
+
+const v4 = (address, extra = {}) => ({ address, family: 'IPv4', internal: false, ...extra });
+
+test('only usable LAN IPv4 addresses are advertised: no loopback, link-local, IPv6 or virtual/VPN adapters', () => {
+  const interfaces = {
+    'Wi-Fi': [v4('192.168.1.20'), { address: 'fe80::1', family: 'IPv6', internal: false }],
+    'vEthernet (WSL)': [v4('172.27.160.1')],
+    'vEthernet (Default Switch)': [v4('172.20.0.1')],
+    'VirtualBox Host-Only Network': [v4('192.168.56.1')],
+    'Tailscale': [v4('100.101.102.103')],
+    'Ethernet 2': [v4('169.254.12.34')],
+    'Loopback Pseudo-Interface 1': [v4('127.0.0.1', { internal: true })]
+  };
+  assert.deepEqual(lanAddresses(interfaces), ['192.168.1.20']);
+});
+
+test('a PC whose only address is on an adapter that looks virtual still advertises it rather than nothing', () => {
+  assert.deepEqual(lanAddresses({ 'vEthernet (External Switch)': [v4('192.168.1.30')], Ethernet: [v4('169.254.1.1')] }), ['192.168.1.30']);
+  assert.deepEqual(lanAddresses({}), []);
+});
+
+test('the responder answers only with the chosen addresses, re-announces when they change, and logs each set', async () => {
+  const os = require('node:os');
+  const real = os.networkInterfaces();
+  const lines = [];
+  const logger = { info: (m) => lines.push(m), warn: (m) => lines.push(m) };
+  let interfaces = real;
+  const handle = advertise({ hostname: testHostname(), port: 9443, logger, getInterfaces: () => interfaces, recheckMs: 50 });
+  try {
+    const expected = lanAddresses(real);
+    const records = handle.records();
+    assert.deepEqual(records.filter((r) => r.type === 'A').map((r) => r.data).sort(), expected, 'A records are exactly the chosen addresses');
+    assert.equal(records.filter((r) => r.type === 'AAAA').length, 0, 'no IPv6 records');
+    assert.match(lines[0], /Advertising dp-test-.*\.local on the local network as/);
+
+    // The PC's address changes (new DHCP lease, cable instead of Wi-Fi...).
+    interfaces = { Ethernet: [v4('10.9.8.7')] };
+    const deadline = Date.now() + 3000;
+    while (!handle.addresses().includes('10.9.8.7') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.deepEqual(handle.addresses(), ['10.9.8.7']);
+    assert.ok(lines.some((l) => /network addresses changed .* -> 10\.9\.8\.7/.test(l)), lines.join('\n'));
+  } finally {
+    await handle.stop();
+  }
+});

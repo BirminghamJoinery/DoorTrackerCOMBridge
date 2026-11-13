@@ -14,6 +14,11 @@ contextBridge.exposeInMainWorld('comBridge', {
   getPrinterStatus: (printerName) => ipcRenderer.invoke('get-printer-status', printerName),
   printTestPattern: (dims) => ipcRenderer.invoke('print-test-pattern', dims),
   reprintTestJob: (jobId) => ipcRenderer.invoke('test-reprint-job', { jobId }),
+  getDoorPrintSettings: () => ipcRenderer.invoke('get-door-print-settings'),
+  saveDoorPrintSettings: (settings) => ipcRenderer.invoke('save-door-print-settings', settings),
+  onGeneralDoorPrintEvent: (callback) => {
+    ipcRenderer.on('general-door-print-event', (event, data) => callback(data));
+  },
 
   onStatus: (callback) => {
     ipcRenderer.on('port-status', (event, data) => callback(data));

@@ -109,9 +109,17 @@ class PrintJobProcessor {
   // drain() both run synchronously with no `await` in between, so two
   // enqueue() calls can never race each other on Node's single-threaded
   // event loop.
-  enqueue(rawJob, apiBase) {
+  //
+  // options.printerName (optional): print this job on exactly that printer
+  // instead of the main configured one - used only by General Door Code
+  // Printing (general-door-trigger.js) for a station's own printer.
+  // printer-service.js never falls back to another printer when it is set.
+  enqueue(rawJob, apiBase, options = {}) {
     const job = normalizeJob(rawJob);
     if (!job) return;
+    if (options && typeof options.printerName === 'string' && options.printerName) {
+      job.printerName = options.printerName;
+    }
 
     if (this.seenJobIds.has(job.jobId)) {
       this.emit(job.jobId, 'SKIPPED', 'Already seen by this bridge instance — not processed again.');

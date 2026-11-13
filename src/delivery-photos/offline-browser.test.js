@@ -422,7 +422,9 @@ test('offline app shell, offline scanning, offline capture, and foreground sync 
     await page.waitForSelector('#pending-screen:not([hidden])');
     assert.match(await page.textContent('#pending-list'), /5698-P2-DELIV/);
     assert.match(await page.textContent('#pending-list'), /3 photos/);
-    assert.match(await page.textContent('#pending-list'), /Waiting for workshop network/);
+    // The real reason, not a generic "waiting for workshop network".
+    assert.match(await page.textContent('#pending-list'), /Photo Service unreachable/);
+    assert.match(await page.textContent('#pending-list'), /Could not connect to localhost:\d+/);
     await page.waitForFunction(() => /nearly full \(85% used\)/.test(document.getElementById('storage-warning').textContent));
     assert.equal(await page.isVisible('#storage-warning'), true);
     // Headless Chrome refuses persistent storage, so the person is told so too.
@@ -581,7 +583,7 @@ test('Bench and Ironmongery iPads in a real browser: role shown, codes checked, 
     assert.match(benchPending, /Bench/);
     assert.match(benchPending, /5698/);
     assert.match(benchPending, /4 photos/);
-    assert.match(benchPending, /Waiting for workshop network/);
+    assert.match(benchPending, /Photo Service unreachable/); // the real reason, not a generic "waiting"
     await irn.page.click('#scan-next-button');
     await irn.page.click('#scan-screen [data-pending-banner]');
     await irn.page.waitForSelector('#pending-screen:not([hidden])');
@@ -850,6 +852,138 @@ test('QR Codes and Data Matrix codes scanned through the camera behave identical
     for (const url of requests) assert.ok(url.startsWith(`${origin}/`) || url.startsWith(`blob:${origin}/`) || url.startsWith('data:'), `unexpected request to ${url}`);
 
     for (const { context } of [delivery, bench, irn]) await context.close();
+  } finally {
+    await browser.close();
+    if (handle) await stopService();
+    env.cleanup();
+  }
+});
+
+test('SEND PENDING NOW in a real browser: always reports what happened (unreachable, server error, sent), logs it, and spots a stale offline copy', { timeout: 180000 }, async (t) => {
+  const env = makeEnv();
+  const port = PORT + 6;
+  const credentials = ensureCertificates(nodePath.join(env.home, 'certs'), 'localhost');
+  const spki = createHash('sha256').update(new X509Certificate(credentials.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64');
+  const browser = await launchChrome(spki);
+  if (!browser) {
+    env.cleanup();
+    t.skip('Google Chrome is not installed on this machine - the browser-level test needs it.');
+    return;
+  }
+  const config = { hostname: 'localhost', port, photoRoot: env.share, maxPhotoBytes: 18 * 1000 * 1000, operationTimeoutSeconds: 20, minFreeGb: 0 };
+  const pairing = new PairingManager({ devicesPath: nodePath.join(env.home, 'paired-devices.json') });
+  const logger = recordingLogger();
+  const browserLog = [];
+  let handle = null;
+  const startService = async () => {
+    handle = startServers({ config, credentials, runWorker: runInWorker, logger, spoolDir: env.spool, pairing, limiter: new ConcurrencyLimiter(), queueDir: nodePath.join(env.home, 'tracking-queue'), filedLogDir: nodePath.join(env.home, 'filed-sessions') });
+    await handle.listen();
+  };
+  const stopService = async () => {
+    const closing = handle.close();
+    handle.httpsServer.closeAllConnections();
+    handle.httpServer.closeAllConnections();
+    await closing;
+    handle = null;
+  };
+  const origin = `https://localhost:${port}`;
+  const files = (folder) => {
+    try {
+      return fs.readdirSync(nodePath.join(env.share, folder)).sort();
+    } catch {
+      return [];
+    }
+  };
+  const resultLine = (page) => page.textContent('#pending-sync-result');
+
+  try {
+    await startService();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    watchPage(page, 'delivery', browserLog);
+    const diagnose = diagnostics({ pages: { delivery: page }, pairing, origin, caCert: credentials.caCert, share: env.share, folders: ['5698'], logger, browserLog });
+
+    await page.goto(`${origin}/`);
+    await page.waitForSelector('#pairing-screen:not([hidden])');
+    await page.fill('#pairing-code-input', pairing.generateCode({ role: 'delivery' }).code);
+    await page.click('#pairing-form button[type=submit]');
+    await page.waitForSelector('#scan-screen:not([hidden])');
+    await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller), null, { timeout: 30000 });
+    const token = await page.evaluate(() => localStorage.getItem('deliveryPhotosToken'));
+
+    // The offline copy reports the same version the PC serves.
+    const swVersion = await page.evaluate(
+      () =>
+        new Promise((resolve) => {
+          const channel = new MessageChannel();
+          channel.port1.onmessage = (e) => resolve(e.data.version);
+          navigator.serviceWorker.controller.postMessage({ type: 'get-version' }, [channel.port2]);
+        })
+    );
+    const health = await page.evaluate(async () => (await fetch('/api/health')).json());
+    assert.match(swVersion, /^[0-9a-f]{16}$/);
+    assert.equal(health.appVersion, swVersion);
+
+    // ---- 1. Away from the PC: a delivery is saved on the iPad.
+    await stopService();
+    await page.reload();
+    await page.waitForSelector('#scan-screen:not([hidden])', { timeout: 30000 });
+    assert.equal(await captureDelivery(page, '5698-DELIV', 2), 'Saved on this iPad');
+    await page.click('#scan-next-button');
+    await page.waitForSelector('#scan-screen:not([hidden])');
+    await page.click('#scan-screen [data-pending-banner]');
+    await page.waitForSelector('#pending-screen:not([hidden])');
+
+    // ---- 2. SEND PENDING NOW with the PC unreachable: says so, and why.
+    await page.click('#send-pending-button');
+    await page.waitForFunction(() => /Photo Service unreachable/.test(document.getElementById('pending-sync-result').textContent), null, { timeout: 30000 });
+    assert.match(await resultLine(page), new RegExp(`Could not connect to localhost:${port}`));
+    assert.match(await page.getAttribute('#pending-sync-result', 'class'), /result-error/);
+    assert.match(await page.textContent('#pending-list'), /Photo Service unreachable/);
+    let log = await page.textContent('#sync-log');
+    for (const event of ['send-pending-pressed', 'sync-start', 'queue-read sessions=1', 'health', 'sync-end outcome=unreachable']) assert.match(log, new RegExp(event), `the diagnostics log shows ${event}`);
+    assert.doesNotMatch(log, new RegExp(token), 'the pairing token is never logged');
+    assert.match(await page.textContent('#sync-diagnostics-facts'), new RegExp(`Tool address: ${origin}`));
+
+    // ---- 3. The PC is back but its pairing check fails with a server error:
+    //         "Server returned 500" - not "not reachable", and NOT "unpaired".
+    await startService();
+    const realVerify = pairing.verify.bind(pairing);
+    pairing.verify = () => {
+      throw new Error('devices file unreadable');
+    };
+    await page.click('#send-pending-button');
+    await page.waitForFunction(() => /Server returned 500/.test(document.getElementById('pending-sync-result').textContent), null, { timeout: 30000 });
+    assert.equal(await page.evaluate(() => localStorage.getItem('deliveryPhotosToken')), token, 'a server error never clears the pairing');
+    assert.deepEqual(files('5698'), []);
+
+    // ---- 4. Fixed on the PC: SEND PENDING NOW files it.
+    pairing.verify = realVerify;
+    await page.click('#send-pending-button');
+    await waitFor(() => files('5698').length === 2, { message: 'the pending photos to be filed', diagnose });
+    await page.waitForFunction(() => /Nothing waiting/.test(document.getElementById('pending-summary').textContent), null, { timeout: 30000 });
+    await page.waitForFunction(() => /Finished: 1 sent|Nothing waiting/.test(document.getElementById('pending-sync-result').textContent), null, { timeout: 30000 });
+    log = await page.textContent('#sync-log');
+    assert.match(log, /upload-result .*status=201/);
+    assert.match(log, /session-result .*outcome=sent/);
+
+    // ---- 5. A stale offline copy: the PC now serves a newer version than
+    //         the one this open page was loaded from -> offered a reload.
+    await page.addInitScript(() => {
+      const realFetch = window.fetch.bind(window);
+      window.fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (/\/api\/health$/.test(url)) return new Response(JSON.stringify({ ok: true, appVersion: 'ffffffffffffffff' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return realFetch(input, init);
+      };
+    });
+    await page.reload();
+    await page.waitForSelector('#scan-screen:not([hidden])', { timeout: 30000 });
+    await page.waitForFunction(() => !document.getElementById('update-banner').hidden, null, { timeout: 30000 });
+    assert.match(await page.textContent('#update-banner'), /newer version/);
+    assert.match(await page.textContent('#sync-diagnostics-facts'), /PC is serving ffffffffffffffff/);
+
+    await context.close();
   } finally {
     await browser.close();
     if (handle) await stopService();

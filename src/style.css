@@ -250,6 +250,38 @@ button:disabled {
   min-height: 16px;
 }
 
+.door-print-section {
+  width: 100%;
+  border-top: 1px solid #ddd;
+  padding-top: 10px;
+}
+
+.door-print-section h3 {
+  margin: 0 0 4px;
+}
+
+.door-print-section .hint {
+  margin: 0 0 10px;
+  padding: 0;
+  font-size: 13px;
+}
+
+.door-print-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.door-print-enable {
+  justify-content: flex-end;
+  padding-bottom: 4px;
+}
+
+.door-print-table .failed {
+  color: #b91c1c;
+}
+
 .api-message-cell.error {
   color: #b91c1c;
 }

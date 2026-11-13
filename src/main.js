@@ -4,7 +4,10 @@ const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { fork } = require('child_process');
 const { SerialPort } = require('serialport');
-const { deriveApiBase, fetchPendingJobs, reprintJob } = require('./print-job-client');
+const { deriveApiBase, fetchPendingJobs, reprintJob, createOrderLabelJob } = require('./print-job-client');
+const { createGeneralDoorTrigger, runScanActions, jobStationKey } = require('./general-door-trigger');
+const doorPrintSettings = require('./door-print-settings');
+const { STATIONS } = require('./com-options');
 const { PrintJobProcessor } = require('./print-job-processor');
 const { createPrintAttemptStore } = require('./print-attempt-store');
 const printerSettings = require('./printer-settings');
@@ -58,6 +61,53 @@ const printAttemptStore = createPrintAttemptStore(path.join(app.getPath('userDat
 const printProcessor = new PrintJobProcessor({
   onEvent: (event) => sendPrintJobEvent(event.jobId, event.status, event.message),
   priorAttemptStore: printAttemptStore
+});
+
+// ---- General Door Code Printing ----
+//
+// A scanner at a station configured for it scans an order's general door
+// code ("5698-D", "5626-2-D") -> the website creates that order's normal
+// label job -> the SAME printProcessor above prints it, addressed to that
+// station's own printer. See general-door-trigger.js. Rules are per station
+// (door-print-settings.json in userData) and read fresh on every matching
+// scan, so a printer change applies to the very next scan.
+const DOOR_PRINT_SETTINGS_PATH = () => path.join(app.getPath('userData'), 'door-print-settings.json');
+const STATION_NAMES = new Map(STATIONS.map((s) => [s.key, s.label]));
+
+function loadDoorPrintSettings() {
+  return doorPrintSettings.loadDoorPrintSettings(DOOR_PRINT_SETTINGS_PATH());
+}
+
+// The station's printer must exist and be online right now - never a
+// fallback to the main printer or the Windows default.
+async function checkStationPrinter(printerName) {
+  const status = await windowsPrinter.getPrinterStatus(printerName);
+  if (!status.supported) return { ok: false, reason: `Printer unavailable - printing is only implemented on Windows (this is ${process.platform})` };
+  if (!status.found) return { ok: false, reason: `Printer unavailable - "${printerName}" was not found on this PC` };
+  if (status.offline) return { ok: false, reason: `Printer unavailable - "${printerName}" is offline` };
+  return { ok: true };
+}
+
+function sendGeneralDoorPrintEvent(outcome) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const { apiUrl, ...safe } = outcome; // nothing the UI needs, kept out of the renderer
+    mainWindow.webContents.send('general-door-print-event', { ...safe, at: new Date().toISOString() });
+  }
+}
+
+const generalDoorTrigger = createGeneralDoorTrigger({
+  getRule: (stationKey) => doorPrintSettings.ruleForStation(loadDoorPrintSettings(), stationKey),
+  checkPrinter: checkStationPrinter,
+  createJob: async ({ order, stationKey, portPath, apiUrl }) => {
+    const apiBase = deriveApiBase(apiUrl);
+    if (!apiBase) return { ok: false, error: 'No API URL configured.' };
+    const result = await createOrderLabelJob(apiBase, { order, stationKey: jobStationKey(stationKey), device: portPath, source: 'combridge_general_door' });
+    return result.ok ? { ok: true, job: result.job, apiBase } : result;
+  },
+  enqueue: (job, apiBase, options) => printProcessor.enqueue(job, apiBase, options),
+  logger: comLogger,
+  stationLabel: (key) => STATION_NAMES.get(key) || key,
+  onOutcome: sendGeneralDoorPrintEvent
 });
 
 // ---- Delivery Photos ----
@@ -321,13 +371,20 @@ function sendScan(tabId, portPath, value) {
   // called with an undefined scan context.
   if (!conn) return;
 
-  postScanToApi(tabId, id, {
-    apiUrl: conn.apiUrl,
-    stationKey: conn.stationKey,
-    baudRate: conn.baudRate,
-    device: portPath,
-    source: 'com_listener'
-  }, value);
+  // The scan is submitted exactly as before; General Door Code Printing is
+  // an extra action after it that never blocks, delays or fails it.
+  runScanActions({
+    postScan: () => postScanToApi(tabId, id, {
+      apiUrl: conn.apiUrl,
+      stationKey: conn.stationKey,
+      baudRate: conn.baudRate,
+      device: portPath,
+      source: 'com_listener'
+    }, value),
+    trigger: generalDoorTrigger,
+    scan: { value, stationKey: conn.stationKey, portPath, apiUrl: conn.apiUrl },
+    onTriggerError: (err) => comLogger.error(`General door label trigger error on ${portPath}: ${err && err.message}`)
+  });
 }
 
 function sendApiResult(tabId, id, status, message) {
@@ -471,6 +528,42 @@ async function recoverPendingJobs(tabId) {
 
   for (const job of result.jobs) {
     printProcessor.enqueue(job, apiBase);
+  }
+}
+
+// The General Door Code Printing counterpart of recoverPendingJobs above:
+// that station's own unfinished jobs (recorded under jobStationKey(), so
+// recoverPendingJobs never sees them) go back to the same printProcessor,
+// addressed to the station's CURRENT printer. A job that has no local
+// attempt record would really print, so it is only enqueued while the
+// station is still enabled and its printer is available - otherwise it is
+// left pending on the website and logged, never sent to another printer.
+async function recoverPendingGeneralDoorJobs(tabId) {
+  const conn = connections.get(tabId);
+  if (!conn || !conn.apiUrl || !conn.stationKey) return;
+  const apiBase = deriveApiBase(conn.apiUrl);
+  if (!apiBase) return;
+
+  const result = await fetchPendingJobs(apiBase, jobStationKey(conn.stationKey));
+  if (!result.ok || result.jobs.length === 0) return;
+
+  const station = STATION_NAMES.get(conn.stationKey) || conn.stationKey;
+  const rule = doorPrintSettings.ruleForStation(loadDoorPrintSettings(), conn.stationKey);
+  const usable = rule && rule.enabled && rule.printerName ? await checkStationPrinter(rule.printerName) : { ok: false, reason: 'General door printing is not enabled for this station' };
+
+  for (const job of result.jobs) {
+    if (printAttemptStore.get(job.jobId)) {
+      // Already attempted/submitted before a restart: the processor only
+      // confirms or fails it, it never prints it again.
+      printProcessor.enqueue(job, apiBase, rule && rule.printerName ? { printerName: rule.printerName } : {});
+      continue;
+    }
+    if (!usable.ok) {
+      comLogger.warn(`General door label job ${job.jobId} (order ${job.baseOrder || '?'}, station ${station}) left pending: ${usable.reason}`);
+      continue;
+    }
+    comLogger.info(`General door label job ${job.jobId} (order ${job.baseOrder || '?'}, station ${station}) recovered after reconnect - printing on ${rule.printerName}.`);
+    printProcessor.enqueue(job, apiBase, { printerName: rule.printerName });
   }
 }
 
@@ -638,6 +731,32 @@ ipcMain.handle('test-reprint-job', async (event, { jobId }) => {
   return { ok: true };
 });
 
+// ---- General Door Code Printing settings (this PC only - no Remote Admin route) ----
+
+ipcMain.handle('get-door-print-settings', async () => loadDoorPrintSettings());
+
+ipcMain.handle('save-door-print-settings', async (event, raw) => {
+  let installedPrinters;
+  try {
+    const listed = await windowsPrinter.listPrinters();
+    if (listed.supported) installedPrinters = listed.printers.map((p) => p.name);
+  } catch (err) {
+    return { ok: false, errors: [`Could not read the installed printers: ${err.message}`] };
+  }
+  let result;
+  try {
+    result = doorPrintSettings.saveDoorPrintSettings(DOOR_PRINT_SETTINGS_PATH(), raw || {}, { installedPrinters });
+  } catch (err) {
+    return { ok: false, errors: [`Could not save: ${err.message}`] };
+  }
+  if (!result.ok) return result;
+  const summary = result.settings.stations
+    .map((row) => `${STATION_NAMES.get(row.stationKey) || row.stationKey}: ${row.enabled ? `enabled, printer ${row.printerName}` : 'disabled'}`)
+    .join('; ');
+  comLogger.info(`General Door Code Printing settings saved on this PC - ${summary || 'no stations'}.`);
+  return { ok: true, settings: result.settings };
+});
+
 // Opens one tab's COM port - the one implementation behind both the Windows
 // app's Connect button (the connect-port handler below) and Remote Admin's
 // Connect/Reconnect (see remote-admin/actions.js). `source` only labels the
@@ -688,6 +807,7 @@ function openConnection({ tabId, path: portPath, baudRate, stationKey, apiUrl, s
       // is what decides which stations ever have print jobs (only
       // Pre-Hung does today), so this never needs to hard-code that here.
       recoverPendingJobs(tabId);
+      recoverPendingGeneralDoorJobs(tabId).catch((err) => comLogger.warn(`General door job recovery on ${portPath} failed: ${err.message}`));
     });
 
     port.on('data', (chunk) => handleIncomingData(tabId, portPath, chunk));

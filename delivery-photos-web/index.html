@@ -125,8 +125,16 @@
   </div>
   <p class="warning" data-auth-banner hidden>Pair this iPad again before pending photos can be sent. <button type="button" class="link-button inline-link" data-pair-now>Pair now</button></p>
   <p id="pending-summary" class="scan-instruction"></p>
+  <p class="warning" id="update-banner" hidden>A newer version of this tool is on the workshop PC. <button type="button" class="link-button inline-link" id="update-reload-button">Reload now</button></p>
   <button type="button" id="send-pending-button" class="primary-button">SEND PENDING NOW</button>
+  <p id="pending-sync-result" class="pending-sync-result" role="status" aria-live="polite"></p>
   <ul id="pending-list" class="pending-list"></ul>
+
+  <details class="sync-diagnostics" id="sync-diagnostics">
+    <summary>Sending diagnostics</summary>
+    <p id="sync-diagnostics-facts"></p>
+    <pre id="sync-log" class="sync-log"></pre>
+  </details>
 
   <div class="storage-panel">
     <h3>Offline storage on this iPad</h3>

@@ -168,7 +168,7 @@ class Runtime {
       return;
     }
 
-    this.mdnsHandle = advertise({ hostname: config.hostname, port: config.port });
+    this.mdnsHandle = advertise({ hostname: config.hostname, port: config.port, logger: this.logger });
 
     this.report({
       state: 'running',

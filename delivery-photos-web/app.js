@@ -70,7 +70,12 @@
     pairingIntro: document.getElementById('pairing-intro'),
     manualEntryLabel: document.getElementById('manual-entry-label'),
     captureRole: document.getElementById('capture-role'),
-    pendingTitle: document.getElementById('pending-title')
+    pendingTitle: document.getElementById('pending-title'),
+    pendingSyncResult: document.getElementById('pending-sync-result'),
+    syncDiagnosticsFacts: document.getElementById('sync-diagnostics-facts'),
+    syncLog: document.getElementById('sync-log'),
+    updateBanner: document.getElementById('update-banner'),
+    updateReloadButton: document.getElementById('update-reload-button')
   };
 
   const Queue = window.DeliveryOfflineQueue;
@@ -89,11 +94,71 @@
     pending: [], // the offline queue's sessions, as last read
     syncProgress: null, // { sessionId, sending, total } | { sessionId, completing } while sending
     persisted: null, // navigator.storage.persisted() - true/false, or null if unsupported
-    lastScreen: null
+    lastScreen: null,
+    lastSync: null, // the last sync result, for the Pending screen's result line
+    loadedShellVersion: null, // the offline app-shell version this page was loaded from
+    serverShellVersion: null // the version the PC is serving now
   };
 
   let offlineStore = null; // null if this browser cannot store anything offline
   let syncEngine = null;
+
+  // ---- Sending diagnostics -------------------------------------------------
+  // A short rolling log of what sending did and why, shown under "Sending
+  // diagnostics" on the Pending screen (an iPad has no console anyone can
+  // read). Kept in this site's localStorage so it survives closing the tool.
+  // Holds only events, addresses, HTTP statuses and messages - never the
+  // pairing token, never photo data.
+  const SYNC_LOG_KEY = 'deliveryPhotosSyncLog';
+  const SYNC_LOG_MAX = 150;
+  const SECRET_FIELDS = /token|authorization|password|bytes|body/i;
+
+  function readSyncLog() {
+    try {
+      const list = JSON.parse(localStorage.getItem(SYNC_LOG_KEY) || '[]');
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function formatLogDetails(details) {
+    return Object.entries(details || {})
+      .filter(([key, value]) => !SECRET_FIELDS.test(key) && value !== '' && value !== undefined && value !== null)
+      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
+      .join(' ')
+      .slice(0, 400);
+  }
+
+  function syncLog(event, details) {
+    const line = `${new Date().toISOString().slice(11, 19)} ${event}${details ? ` ${formatLogDetails(details)}` : ''}`;
+    try {
+      console.info(`[delivery-photos] ${line}`);
+    } catch {
+      // no console
+    }
+    const list = readSyncLog();
+    list.push(line);
+    try {
+      localStorage.setItem(SYNC_LOG_KEY, JSON.stringify(list.slice(-SYNC_LOG_MAX)));
+    } catch {
+      // storage full or blocked - the log is a convenience only
+    }
+    renderDiagnostics();
+  }
+
+  function renderDiagnostics() {
+    if (!els.syncLog || !els.syncDiagnosticsFacts) return;
+    const c = state.connection || {};
+    const facts = [
+      `Tool address: ${location.origin}`,
+      `Pairing saved on this iPad: ${getStoredToken() ? 'yes' : 'no'}`,
+      `Last check: ${c.reachable === null || c.reachable === undefined ? 'not yet' : c.reachable ? (c.ok === false ? `answered with an error (${c.reason || c.status})` : c.paired ? 'connected and paired' : 'connected, not paired') : `not reachable - ${c.reason || 'no answer'}`}`,
+      `App version on this iPad: ${state.loadedShellVersion || 'unknown'}${state.serverShellVersion ? ` (PC is serving ${state.serverShellVersion})` : ''}`
+    ];
+    els.syncDiagnosticsFacts.textContent = facts.join('\n');
+    els.syncLog.textContent = readSyncLog().slice().reverse().join('\n') || 'Nothing logged yet.';
+  }
 
   function show(screen) {
     for (const el of [els.pairingScreen, els.scanScreen, els.captureScreen, els.resultScreen, els.pendingScreen]) el.hidden = el !== screen;
@@ -265,48 +330,143 @@
   // tells us whether this iPad is still paired). /api/ requests always go to
   // the real network - the Service Worker never answers them from a cache.
 
-  const SERVICE_CHECK_TIMEOUT_MS = 5000;
+  // Generous: on an iPad the first lookup of a ".local" name plus a fresh TLS
+  // connection can take several seconds, and a too-short check used to report
+  // a perfectly reachable PC as "not reachable".
+  const SERVICE_CHECK_TIMEOUT_MS = 10000;
 
+  // The tool always talks to the address it was opened from (location.origin
+  // - e.g. https://door-tracker.local:8443). Reaching the PC by any OTHER
+  // address (its IP, say) does not help this copy: its pending photos and
+  // pairing are stored for this address only.
+  //
+  // Resolves { reachable, paired, role, ok, status, kind, reason, url, ms,
+  // authState }: `reachable` false only when nothing answered at all; an
+  // answer with an HTTP error is reachable:true, ok:false, with the status.
   async function checkService() {
+    const url = `${location.origin}/api/pair/check`;
+    const token = getStoredToken();
+    const authState = token ? 'present' : 'missing';
+    const started = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), SERVICE_CHECK_TIMEOUT_MS);
-    const token = getStoredToken();
+    let response;
     try {
-      const response = await fetch('/api/pair/check', { headers: token ? { Authorization: `Bearer ${token}` } : {}, cache: 'no-store', signal: controller.signal });
-      if (!response.ok) return { reachable: false, paired: false };
-      const data = await response.json().catch(() => ({ paired: false }));
-      const paired = Boolean(token && data.paired);
-      return { reachable: true, paired, role: paired && Roles.isRole(data.role) ? data.role : null };
-    } catch {
-      return { reachable: false, paired: false };
+      response = await fetch('/api/pair/check', { headers: token ? { Authorization: `Bearer ${token}` } : {}, cache: 'no-store', signal: controller.signal });
+    } catch (err) {
+      const timedOut = err && err.name === 'AbortError';
+      return {
+        reachable: false,
+        paired: false,
+        kind: timedOut ? 'timeout' : 'unreachable',
+        reason: timedOut
+          ? `No answer from ${location.host} within ${SERVICE_CHECK_TIMEOUT_MS / 1000} s`
+          : `Could not connect to ${location.host} (${(err && err.message) || 'network error'}) - the name may not resolve on this network, the certificate may not be trusted, or the PC is not reachable at this address`,
+        url,
+        ms: Date.now() - started,
+        authState
+      };
     } finally {
       clearTimeout(timer);
     }
+    const ms = Date.now() - started;
+    if (!response.ok) {
+      const kind = Queue.classifyHttpStatus(response.status);
+      return { reachable: true, ok: false, paired: false, status: response.status, kind, reason: `${Queue.failureLabel(kind, response.status)} (HTTP ${response.status} from ${location.host})`, url, ms, authState };
+    }
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!data || typeof data !== 'object') {
+      return { reachable: true, ok: false, paired: false, status: response.status, kind: 'server', reason: `The Photo Service at ${location.host} gave an unreadable answer`, url, ms, authState };
+    }
+    const paired = Boolean(token && data.paired);
+    const role = paired && Roles && Roles.isRole(data.role) ? data.role : null;
+    return { reachable: true, ok: true, paired, role, status: response.status, url, ms, authState, kind: paired ? '' : 'pairing', reason: paired ? '' : token ? 'The Photo Service no longer recognises this iPad\'s pairing' : 'No pairing is saved on this iPad' };
   }
 
   async function refreshConnection() {
     const service = await checkService();
-    if (service.reachable && !service.paired && getStoredToken()) setStoredToken(''); // revoked on the PC
+    // Only a clear "not paired" answer from the PC clears the stored token -
+    // never a timeout or a server error.
+    if (service.reachable && service.ok && !service.paired && getStoredToken()) {
+      syncLog('pairing-revoked', { url: service.url });
+      setStoredToken(''); // revoked on the PC
+    }
     if (service.paired && service.role) setRole(service.role); // e.g. removed and re-paired as another role on the PC
+    const changed = !state.connection || state.connection.reachable !== service.reachable || state.connection.paired !== service.paired || state.connection.reason !== service.reason;
     state.connection = service;
+    if (changed) syncLog('health', { url: service.url, reachable: service.reachable, paired: service.paired, status: service.status, kind: service.kind, ms: service.ms, auth: service.authState, reason: service.reason });
+    if (service.reachable && service.ok) checkAppVersion();
     renderConnection();
     return service;
   }
 
+  // ---- Stale offline copy ----------------------------------------------------
+  // The Service Worker (sw.js) keeps a copy of this tool for offline use and
+  // replaces it when the PC has a newer one - but a page that is ALREADY open
+  // keeps running the old code until it is reloaded. Compare the version this
+  // page was loaded from with what the PC serves now, and offer a reload.
+  function askServiceWorkerVersion() {
+    return new Promise((resolve) => {
+      const controller = navigator.serviceWorker && navigator.serviceWorker.controller;
+      if (!controller || typeof MessageChannel === 'undefined') return resolve(null);
+      const channel = new MessageChannel();
+      const timer = setTimeout(() => resolve(null), 2000);
+      channel.port1.onmessage = (event) => {
+        clearTimeout(timer);
+        resolve((event.data && event.data.version) || null);
+      };
+      try {
+        controller.postMessage({ type: 'get-version' }, [channel.port2]);
+      } catch {
+        clearTimeout(timer);
+        resolve(null);
+      }
+    });
+  }
+
+  let versionChecked = false;
+  async function checkAppVersion() {
+    if (versionChecked) return;
+    versionChecked = true;
+    try {
+      const response = await fetch('/api/health', { cache: 'no-store' });
+      const data = await response.json();
+      state.serverShellVersion = (data && data.appVersion) || null;
+    } catch {
+      versionChecked = false; // try again on the next successful check
+      return;
+    }
+    // Loaded straight from the network (no offline copy in charge yet) means
+    // this page IS the current version.
+    if (!state.loadedShellVersion && !(navigator.serviceWorker && navigator.serviceWorker.controller)) state.loadedShellVersion = state.serverShellVersion;
+    const stale = Boolean(state.loadedShellVersion && state.serverShellVersion && state.loadedShellVersion !== state.serverShellVersion);
+    if (stale) syncLog('app-version', { running: state.loadedShellVersion, pc: state.serverShellVersion, stale: true });
+    if (els.updateBanner) els.updateBanner.hidden = !stale;
+    renderDiagnostics();
+  }
+
   function renderConnection() {
-    const { reachable, paired } = state.connection;
+    const { reachable, paired, ok, reason } = state.connection;
     const internet = navigator.onLine ? 'Internet: available' : 'Internet: offline';
     let text;
     let cls = '';
-    if (reachable === null) text = 'Checking the workshop Photo Service…';
-    else if (reachable && paired) {
+    if (reachable === null || reachable === undefined) text = 'Checking the workshop Photo Service…';
+    else if (reachable && ok === false) {
+      text = `Workshop Photo Service at ${location.host} answered with an error: ${reason}`;
+      cls = 'conn-offline';
+    } else if (reachable && paired) {
       text = 'Workshop Photo Service: connected';
       cls = 'conn-ok';
     } else if (reachable) {
       text = 'Workshop Photo Service: connected, but this iPad is not paired';
       cls = 'conn-offline';
     } else {
-      text = `Workshop Photo Service: not reachable - photos will be saved on this iPad (${internet})`;
+      text = `Workshop Photo Service not reachable at ${location.host} - photos will be saved on this iPad (${internet})${reason ? `. ${reason}.` : ''}`;
       cls = 'conn-offline';
     }
     for (const strip of els.connectionStrips) {
@@ -314,6 +474,7 @@
       strip.querySelector('[data-conn-text]').textContent = text;
     }
     renderAuthBanner();
+    renderDiagnostics();
   }
 
   // ---- SCAN screen ------------------------------------------------------
@@ -523,7 +684,16 @@
   // is only the role the photo was taken as (see offline-queue.js).
   // Resolves { ok } or { ok: false, error, needsPairing?, wrongRole?, unreachable? }.
   function uploadBytes({ role, code, photoId, body, sha256 }) {
-    return new Promise((resolve) => {
+    return new Promise((resolveOnce) => {
+      // Settles exactly once, whichever of load/error/timeout/abort/loadend
+      // fires - an aborted request (the iPad locked or switched apps mid-send)
+      // used to fire none of the handled events and left sending stuck.
+      let settled = false;
+      const resolve = (value) => {
+        if (settled) return;
+        settled = true;
+        resolveOnce(value);
+      };
       const xhr = new XMLHttpRequest();
       xhr.open('PUT', `/api/photos/${encodeURIComponent(code)}/${photoId}`);
       xhr.setRequestHeader('Content-Type', 'image/jpeg');
@@ -532,7 +702,7 @@
       xhr.setRequestHeader('X-Photo-Role', role);
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve({ ok: true });
+          resolve({ ok: true, status: xhr.status });
           return;
         }
         let message = `The server answered ${xhr.status}.`;
@@ -545,10 +715,13 @@
         // again" (401) - the caller uses needsPairing to decide whether to
         // send the person back to the pairing screen instead of just
         // showing a normal per-photo failure.
-        resolve({ ok: false, error: message, needsPairing: xhr.status === 401, wrongRole: xhr.status === 403 });
+        const kind = Queue.classifyHttpStatus(xhr.status);
+        resolve({ ok: false, status: xhr.status, kind, error: `${Queue.failureLabel(kind, xhr.status)}: ${message}`, needsPairing: xhr.status === 401, wrongRole: xhr.status === 403 });
       };
-      xhr.onerror = () => resolve({ ok: false, error: 'Could not reach the Delivery Photos service on this PC.', unreachable: true });
-      xhr.ontimeout = () => resolve({ ok: false, error: 'The upload timed out.', unreachable: true });
+      xhr.onerror = () => resolve({ ok: false, kind: 'unreachable', error: `Could not reach the Photo Service at ${location.host}.`, unreachable: true });
+      xhr.ontimeout = () => resolve({ ok: false, kind: 'timeout', timedOut: true, error: 'The upload timed out.', unreachable: true });
+      xhr.onabort = () => resolve({ ok: false, kind: 'unreachable', error: 'The upload was interrupted (the iPad may have locked or left the app).', unreachable: true });
+      xhr.onloadend = () => resolve({ ok: false, kind: 'unreachable', error: 'The upload ended without an answer.', unreachable: true });
       xhr.timeout = 60000;
       xhr.send(body);
     });
@@ -612,11 +785,13 @@
         cache: 'no-store',
         signal: controller.signal
       });
-      if (response.ok) return { ok: true };
+      if (response.ok) return { ok: true, status: response.status };
       const data = await response.json().catch(() => ({}));
-      return { ok: false, error: data.message || `The server answered ${response.status}.`, needsPairing: response.status === 401, wrongRole: response.status === 403 };
-    } catch {
-      return { ok: false, error: 'Could not reach the Delivery Photos service on this PC.', unreachable: true };
+      const kind = Queue.classifyHttpStatus(response.status);
+      return { ok: false, status: response.status, kind, error: `${Queue.failureLabel(kind, response.status)}: ${data.message || `The server answered ${response.status}.`}`, needsPairing: response.status === 401, wrongRole: response.status === 403 };
+    } catch (err) {
+      const timedOut = err && err.name === 'AbortError';
+      return { ok: false, kind: timedOut ? 'timeout' : 'unreachable', timedOut, error: timedOut ? 'The session-complete report timed out.' : `Could not reach the Photo Service at ${location.host}.`, unreachable: true };
     } finally {
       clearTimeout(timer);
     }
@@ -652,7 +827,7 @@
       els.savingProgress.textContent = 'Checking the connection to the workshop PC...';
       const service = await refreshConnection();
       els.savingOverlay.hidden = true;
-      if (!service.reachable) return await saveSessionOnIpad('unreachable');
+      if (!service.reachable || service.ok === false) return await saveSessionOnIpad('unreachable');
       if (!service.paired) return await saveSessionOnIpad('unpaired');
 
       const { failedCount, needsPairing, wrongRole } = await uploadPending();
@@ -854,9 +1029,31 @@
       const taken = roleInfo(Queue.sessionRole(session));
       return { text: `Taken as ${taken ? taken.label : 'other'} photos - this iPad is now paired for ${roleInfo() ? roleInfo().label : 'something else'}. Pair it as ${taken ? taken.label : 'that role'} again to send, or discard.`, wrongRole: true };
     }
-    if (session.status === Queue.STATUS.FAILED) return { text: 'Could not send - photos remain safely stored on this iPad', error: session.lastError };
-    if (state.connection.reachable === false) return { text: 'Waiting for workshop network' };
+    // The real, current reason - never just "waiting" when the PC (or the
+    // attempt) said something more specific.
+    const kind = session.lastErrorKind || '';
+    const reason = kind ? Queue.failureLabel(kind, session.lastHttpStatus) : '';
+    const when = session.lastErrorAt ? ` (${formatTime(session.lastErrorAt)})` : '';
+    const detail = session.lastError ? `${session.lastError}${when}` : '';
+    if (session.status === Queue.STATUS.FAILED) return { text: 'Could not send - photos remain safely stored on this iPad', reason: reason || 'Could not send', error: detail };
+    if (state.connection.reachable === false) {
+      return { text: 'Waiting to send - photos remain safely stored on this iPad', reason: Queue.failureLabel(state.connection.kind || 'unreachable'), error: state.connection.reason || detail };
+    }
+    if (state.connection.reachable && state.connection.ok === false) {
+      return { text: 'Waiting to send - photos remain safely stored on this iPad', reason: Queue.failureLabel(state.connection.kind || 'server', state.connection.status), error: state.connection.reason };
+    }
+    if (reason) return { text: 'Waiting to retry - photos remain safely stored on this iPad', reason, error: detail };
     return { text: 'Waiting to send' };
+  }
+
+  function formatTime(iso) {
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? 'unknown time' : date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function formatCaptured(iso) {
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? 'unknown date' : capturedFormat.format(date);
   }
 
   function renderPending() {
@@ -891,11 +1088,17 @@
       ref.textContent = role === 'delivery' ? Queue.sessionCode(session) : session.baseOrder || session.orderNumber;
       const meta = document.createElement('div');
       meta.className = 'pending-item-meta';
-      meta.textContent = `${role === 'bench' ? `Scanned ${Queue.sessionCode(session)} · ` : ''}${session.photoCount} ${session.photoCount === 1 ? 'photo' : 'photos'} · Captured ${capturedFormat.format(new Date(session.capturedAt))}`;
+      meta.textContent = `${role === 'bench' ? `Scanned ${Queue.sessionCode(session)} · ` : ''}${session.photoCount} ${session.photoCount === 1 ? 'photo' : 'photos'} · Captured ${formatCaptured(session.capturedAt)}`;
       const statusEl = document.createElement('div');
       statusEl.className = `pending-item-status${status.sending ? ' status-sending' : ''}`;
       statusEl.textContent = status.text;
       li.append(roleEl, ref, meta, statusEl);
+      if (status.reason) {
+        const reasonEl = document.createElement('div');
+        reasonEl.className = 'pending-item-reason';
+        reasonEl.textContent = status.reason;
+        li.appendChild(reasonEl);
+      }
       if (status.error) {
         const err = document.createElement('div');
         err.className = 'pending-item-error';
@@ -921,7 +1124,10 @@
           retry.className = 'secondary-button';
           retry.textContent = 'Retry';
           retry.disabled = Boolean(progress);
-          retry.addEventListener('click', () => runSync({ onlySessionId: session.sessionId }));
+          retry.addEventListener('click', () => {
+            syncLog('retry-pressed', { sessionId: session.sessionId });
+            runSync({ onlySessionId: session.sessionId, reason: 'button' });
+          });
           actions.appendChild(retry);
         }
         const discard = document.createElement('button');
@@ -963,15 +1169,61 @@
   }
 
   // Sends what is waiting. Shared by every trigger - automatic and manual.
-  async function runSync(options) {
-    if (!syncEngine) return null;
-    const result = await syncEngine.syncAll(options);
-    if (result.outcome === 'unreachable') state.connection = { reachable: false, paired: state.connection.paired };
+  // What one send attempt achieved, in one line for the Pending screen.
+  function describeSyncResult(result) {
+    if (!result) return { text: 'Sending is not available - this browser cannot store photographs offline.', error: true };
+    const counts = [result.sent ? `${result.sent} sent` : '', result.failed ? `${result.failed} could not be sent` : '', result.deferred ? `${result.deferred} still waiting` : ''].filter(Boolean).join(', ');
+    switch (result.outcome) {
+      case 'nothing':
+        return { text: `Nothing waiting to send.`, error: false };
+      case 'done':
+        return { text: counts ? `Finished: ${counts}.` : 'Finished.', error: Boolean(result.failed || result.deferred) };
+      case 'busy':
+        return { text: result.reason || 'Already sending.', error: false };
+      case 'needs_pairing':
+        return { text: `Pairing required: ${result.reason || 'pair this iPad again.'}${counts ? ` (${counts})` : ''}`, error: true };
+      case 'unreachable':
+        return { text: `${Queue.failureLabel(result.kind || 'unreachable')}: ${result.reason || ''}${counts ? ` (${counts})` : ''}`, error: true };
+      case 'service_error':
+        return { text: `${Queue.failureLabel(result.kind || 'server', result.status)}: ${result.reason || ''}`, error: true };
+      default:
+        return { text: result.reason || `Sending stopped (${result.outcome}).`, error: true };
+    }
+  }
+
+  function renderSyncResult() {
+    if (!els.pendingSyncResult) return;
+    const summary = state.lastSync;
+    els.pendingSyncResult.textContent = summary ? `${formatTime(summary.at)} - ${summary.text}` : '';
+    els.pendingSyncResult.className = `pending-sync-result${summary ? (summary.error ? ' result-error' : ' result-ok') : ''}`;
+  }
+
+  // Sends what is waiting. Shared by every trigger - automatic and manual.
+  // Never throws: whatever happens ends in a result line and a log entry.
+  async function runSync(options = {}) {
+    if (!syncEngine) {
+      state.lastSync = { at: new Date().toISOString(), ...describeSyncResult(null) };
+      syncLog('sync-unavailable', { why: 'offline storage could not be opened' });
+      renderSyncResult();
+      return null;
+    }
+    let result;
+    try {
+      result = await syncEngine.syncAll(options);
+    } catch (err) {
+      result = { outcome: 'storage_error', sent: 0, failed: 0, deferred: 0, reason: `Sending stopped unexpectedly (${(err && err.message) || err}).` };
+    }
+    if (result.outcome === 'unreachable') state.connection = { ...state.connection, reachable: false, paired: state.connection.paired, kind: result.kind || 'unreachable', reason: result.reason };
+    if (result.outcome === 'service_error') state.connection = { ...state.connection, reachable: true, ok: false, status: result.status, kind: result.kind, reason: result.reason };
     if (result.outcome === 'needs_pairing') {
       setStoredToken('');
-      state.connection = { reachable: true, paired: false };
+      state.connection = { reachable: true, ok: true, paired: false, kind: 'pairing', reason: result.reason };
     }
-    if (result.outcome === 'done') state.connection = { ...state.connection, reachable: true, paired: true };
+    if (result.outcome === 'done') state.connection = { ...state.connection, reachable: true, ok: true, paired: true, kind: '', reason: '' };
+    if (result.outcome !== 'nothing' || options.reason === 'button') {
+      state.lastSync = { at: new Date().toISOString(), ...describeSyncResult(result) };
+    }
+    renderSyncResult();
     renderConnection();
     await refreshPending();
     return result;
@@ -984,18 +1236,23 @@
     if (state.finishing) return;
     const service = await refreshConnection();
     await refreshPending();
-    if (service.reachable && service.paired && state.pending.length > 0 && !state.finishing) runSync();
+    if (service.reachable && service.ok !== false && service.paired && state.pending.length > 0 && !state.finishing) runSync({ reason: 'auto' });
   }
 
   function openPendingScreen(sendNow) {
     state.lastScreen = [els.pairingScreen, els.scanScreen, els.captureScreen, els.resultScreen].find((el) => !el.hidden) || els.scanScreen;
     show(els.pendingScreen);
     refreshPending();
-    if (sendNow) runSync();
+    if (sendNow) runSync({ reason: 'button' });
   }
 
   for (const banner of els.pendingBanners) banner.addEventListener('click', () => openPendingScreen(false));
-  els.sendPendingButton.addEventListener('click', () => runSync());
+  els.sendPendingButton.addEventListener('click', () => {
+    syncLog('send-pending-pressed', { pending: state.pending.length, auth: getStoredToken() ? 'present' : 'missing', url: location.origin });
+    state.lastSync = { at: new Date().toISOString(), text: 'Checking the workshop Photo Service…', error: false };
+    renderSyncResult();
+    runSync({ reason: 'button' });
+  });
   els.pendingBackButton.addEventListener('click', () => {
     if (state.lastScreen === els.resultScreen || state.lastScreen === els.scanScreen || !state.lastScreen) startScanScreen();
     else show(state.lastScreen);
@@ -1008,7 +1265,20 @@
   function registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((err) => console.warn('Offline app shell not available:', err));
-    navigator.serviceWorker.addEventListener('controllerchange', () => renderStorage());
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      renderStorage();
+      // A newer offline copy has taken over; this open page is still the
+      // old code until it is reloaded.
+      versionChecked = false;
+      if (state.connection.reachable) checkAppVersion();
+    });
+  }
+
+  if (els.updateReloadButton) {
+    els.updateReloadButton.addEventListener('click', () => {
+      syncLog('reload-for-update', { running: state.loadedShellVersion, pc: state.serverShellVersion });
+      location.reload();
+    });
   }
 
   async function start() {
@@ -1031,12 +1301,16 @@
         },
         // Only one tab at a time may send, so two open copies of this tool
         // can never upload the same queued session side by side.
-        withLock: navigator.locks ? (fn) => navigator.locks.request('delivery-photos-sync', { ifAvailable: true }, (lock) => (lock ? fn() : null)) : undefined
+        withLock: navigator.locks ? (fn) => navigator.locks.request('delivery-photos-sync', { ifAvailable: true }, (lock) => (lock ? fn() : null)) : undefined,
+        log: syncLog
       });
     } catch (err) {
       console.warn('Offline storage is not available in this browser:', err);
+      syncLog('storage-unavailable', { error: (err && err.message) || String(err) });
     }
+    state.loadedShellVersion = await askServiceWorkerVersion();
     await refreshPending();
+    renderDiagnostics();
     await checkPairingThenStart();
     Queue.installAutoSync({ win: window, doc: document, run: () => autoSync() });
   }

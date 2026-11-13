@@ -26,7 +26,15 @@ const { KeyedMutex } = require('./concurrency');
 const { buildTrustProfileMobileConfig } = require('./certs');
 const { createTrackingEvent, TrackingError } = require('./tracking');
 const { recordFiledSession } = require('./filed-today');
-const { serviceWorkerSource } = require('./web-shell');
+const { serviceWorkerSource, shellVersion: computeShellVersion } = require('./web-shell');
+
+// The app-shell version, computed once per process (the files cannot change
+// while this build is running) - see /api/health.
+let cachedShellVersion = null;
+function shellVersion() {
+  if (!cachedShellVersion) cachedShellVersion = computeShellVersion();
+  return cachedShellVersion;
+}
 
 const STATIC_ROOT = nodePath.join(__dirname, '..', '..', 'delivery-photos-web');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -471,7 +479,15 @@ function router(req, res, deps) {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/pair/check') {
-    return handlePairCheck(req, res, deps);
+    // Guarded like every other route: a failure here answers 500 (which the
+    // iPad shows as "Server returned 500") instead of escaping the handler.
+    try {
+      return handlePairCheck(req, res, deps);
+    } catch (err) {
+      deps.logger.error(`Unexpected error handling a pairing check: ${err && err.message}`);
+      if (!res.headersSent) sendJson(res, 500, { error: 'internal', message: 'Something went wrong.' });
+      return;
+    }
   }
 
   if (req.method === 'POST' && url.pathname === '/api/photo-sessions/complete') {
@@ -491,7 +507,9 @@ function router(req, res, deps) {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/health') {
-    return sendJson(res, 200, { ok: true, hostname: deps.config.hostname });
+    // appVersion: the iPad tool's current app-shell version (web-shell.js), so
+    // an iPad still running an older offline copy can tell and offer a reload.
+    return sendJson(res, 200, { ok: true, hostname: deps.config.hostname, appVersion: shellVersion() });
   }
 
   // reference.js and photo-roles.js are deliberately ONE file each, shared by

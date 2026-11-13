@@ -108,6 +108,31 @@ drive the real iPad page in headless Google Chrome
 (`src/delivery-photos/offline-browser.test.js`), skipping cleanly if Chrome is
 not installed.
 
+## General Door Code Printing
+
+A station can print an order's labels when its scanner scans the order's
+general door code: `5698-D` or `5626-2-D` (four digits, an optional
+call-off, then exactly `-D`). Individual door codes (`5698-D-01`), frame
+codes (`-F`) and delivery codes (`-DELIV`) never trigger it. The scan is
+still sent to the website exactly as before; printing is an extra action.
+
+Set it up in the **Printing** area under **General Door Code Printing**:
+choose a station, a printer, tick **Enable general door label printing**,
+then **Save Station**. Each station has its own printer. The rule belongs to
+the station, not the COM port, so moving a scanner to another port keeps it.
+Settings live in `door-print-settings.json` in the app's user-data folder
+(`%APPDATA%\Door Tracker COM Bridge\`), so updates keep them. Remote Admin
+cannot change them.
+
+On a matching scan the bridge checks the station's printer is installed and
+online, asks the website for the order's normal label job
+(`POST /api/print-jobs/order`), and hands it to the same print-job processor
+as every other job, addressed to that printer only. If the printer is missing
+or offline nothing is printed anywhere else; the failure is logged and shown
+in the table. The same order at the same station is ignored for 45 seconds
+after a successful trigger, so an accidental double scan prints once.
+Scanning again after that prints again.
+
 ## Remote Admin (COM connections from another PC)
 
 Lets the scanner connections be checked and controlled from a normal

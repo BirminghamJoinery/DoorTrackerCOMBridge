@@ -202,7 +202,7 @@ test('sending pending deliveries: every photo in order, then completion, then th
   await store.saveSession(b, shotsB);
 
   const result = await engine.syncAll();
-  assert.deepEqual(result, { outcome: 'done', sent: 2, failed: 0 });
+  assert.deepEqual(result, { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
   assert.deepEqual(service.uploads.map((u) => u.photoId), [...shotsA, ...shotsB].map((p) => p.photoId));
   assert.deepEqual(service.completes, [
     { sessionId: a.sessionId, role: 'delivery', code: '5698-DELIV', photosSaved: 2 },
@@ -222,7 +222,7 @@ test('one failed photo: the session is NOT completed, stays queued, and the othe
   service.rejectPhotoIds.add(badShots[1].photoId);
 
   const result = await engine.syncAll();
-  assert.deepEqual(result, { outcome: 'done', sent: 1, failed: 1 });
+  assert.deepEqual(result, { outcome: 'done', sent: 1, failed: 1, deferred: 0 });
   assert.deepEqual(service.completes.map((c) => c.code), ['5701-DELIV'], 'no completion for the failed session');
 
   const remaining = await store.listSessions();
@@ -272,7 +272,7 @@ test('completion not acknowledged: photos stay recorded as sent, and only the co
   service.failComplete = true;
 
   const first = await engine.syncAll();
-  assert.deepEqual(first, { outcome: 'done', sent: 0, failed: 1 });
+  assert.deepEqual(first, { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
   assert.equal((await store.getSession(session.sessionId)).status, Queue.STATUS.FAILED);
   assert.equal(service.uploads.length, 2);
 
@@ -301,7 +301,7 @@ test('pairing revoked: sending stops, every queued photo is kept, and it all goe
 
   service.paired = true; // re-paired
   const after = await engine.syncAll();
-  assert.deepEqual(after, { outcome: 'done', sent: 2, failed: 0 });
+  assert.deepEqual(after, { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
   assert.deepEqual(await store.listSessions(), []);
 });
 
@@ -500,7 +500,7 @@ test('a Bench iPad sends its queued Bench sessions with their own role and scann
   const b = roleSession('bench', '5626-2-F');
   await store.saveSession(a, photos(2, 'a'));
   await store.saveSession(b, photos(1, 'b'));
-  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 2, failed: 0 });
+  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 2, failed: 0, deferred: 0 });
   assert.deepEqual([...new Set(service.uploads.map((u) => `${u.role} ${u.code}`))], ['bench 5698-D', 'bench 5626-2-F']);
   assert.deepEqual(service.completes, [
     { sessionId: a.sessionId, role: 'bench', code: '5698-D', photosSaved: 2 },
@@ -517,7 +517,7 @@ test('re-paired as another role: sessions taken as the old role are kept, never 
   await store.saveSession(bench, photos(2, 'bench'));
   await store.saveSession(delivery, photos(1, 'deliv'));
 
-  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 1 });
+  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 1, deferred: 0 });
   assert.deepEqual(service.uploads.map((u) => u.code), ['5701-DELIV'], 'nothing of the Bench session was uploaded');
   const [kept] = await store.listSessions();
   assert.equal(kept.sessionId, bench.sessionId);
@@ -526,7 +526,7 @@ test('re-paired as another role: sessions taken as the old role are kept, never 
 
   // Paired as Bench again on the PC: it goes.
   service.role = 'bench';
-  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
   assert.deepEqual(await store.listSessions(), []);
 });
 
@@ -536,7 +536,7 @@ test('the PC refusing a photo for the wrong role keeps the whole session on the 
   const shots = photos(2);
   await store.saveSession(session, shots);
   service.wrongRolePhotoIds.add(shots[0].photoId);
-  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 0, failed: 1 });
+  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 0, failed: 1, deferred: 0 });
   const [kept] = await store.listSessions();
   assert.equal(kept.status, Queue.STATUS.WRONG_ROLE);
   assert.deepEqual(service.completes, []);
@@ -570,6 +570,206 @@ test('a session queued before roles existed (no role, no code) is sent as the De
 
   const service = fakeService();
   const engine = Queue.createSyncEngine({ store, api: service });
-  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0 });
+  assert.deepEqual(await engine.syncAll(), { outcome: 'done', sent: 1, failed: 0, deferred: 0 });
   assert.deepEqual(service.completes, [{ sessionId: legacy.sessionId, role: 'delivery', code: '5698-P-DELIV', photosSaved: 1 }]);
+});
+
+// ---- "SEND PENDING NOW does nothing": robustness and real reasons ------------
+
+// Collects the engine's diagnostic log lines.
+function logSink() {
+  const lines = [];
+  return { lines, log: (event, details) => lines.push({ event, ...details }), events: () => lines.map((l) => l.event) };
+}
+
+test('an upload that never answers cannot freeze sending: it times out and the next Send works', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1));
+  let calls = 0;
+  const realUpload = service.uploadPhoto;
+  service.uploadPhoto = (args) => (++calls === 1 ? new Promise(() => {}) : realUpload(args)); // the first request is lost by the browser
+  const engine = Queue.createSyncEngine({ store, api: service, deadlines: { upload: 50 } });
+  const first = await engine.syncAll();
+  assert.equal(engine.isRunning(), false, 'the run ended');
+  assert.equal(first.outcome, 'done');
+  assert.equal(first.deferred, 1);
+  const [waiting] = await store.listSessions();
+  assert.equal(waiting.status, Queue.STATUS.PENDING);
+  assert.equal(waiting.lastErrorKind, 'timeout');
+  assert.match(waiting.lastError, /No answer from the Photo Service/);
+  const second = await engine.syncAll();
+  assert.equal(second.sent, 1, 'pressing Send again actually sends');
+  assert.deepEqual(await store.listSessions(), []);
+});
+
+test('the first session timing out does not block the valid session behind it (the PC still answers)', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1, 'slow'));
+  await store.saveSession(sessionFor('5699-DELIV'), photos(2, 'ok'));
+  const realUpload = service.uploadPhoto;
+  service.uploadPhoto = (args) => (args.code === '5698-DELIV' ? Promise.resolve({ ok: false, unreachable: true, timedOut: true, error: 'The upload timed out.' }) : realUpload(args));
+  const sink = logSink();
+  const engine = Queue.createSyncEngine({ store, api: service, log: sink.log });
+  const result = await engine.syncAll();
+  assert.deepEqual([result.outcome, result.sent, result.deferred], ['done', 1, 1]);
+  assert.deepEqual(service.completes.map((c) => c.code), ['5699-DELIV']);
+  const left = await store.listSessions();
+  assert.deepEqual(left.map((s) => [s.code, s.status, s.lastErrorKind]), [['5698-DELIV', 'pending', 'timeout']], 'kept, with the reason');
+  assert.ok(sink.lines.some((l) => l.event === 'retry-decision' && l.decision === 'continue'));
+});
+
+test('but when the PC really has gone, sending stops instead of timing out on every session', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1, 'a'));
+  await store.saveSession(sessionFor('5699-DELIV'), photos(1, 'b'));
+  service.dropAfterUploads = 0; // the connection goes on the very first upload
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.equal(result.outcome, 'unreachable');
+  assert.equal(result.deferred, 2);
+  assert.equal(service.uploads.length, 0);
+  assert.equal((await store.listSessions()).length, 2, 'nothing lost');
+});
+
+test('a session that throws on the iPad is marked and skipped - the rest still go, and Send never rejects', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1, 'bad'));
+  await store.saveSession(sessionFor('5699-DELIV'), photos(1, 'good'));
+  const realUpload = service.uploadPhoto;
+  service.uploadPhoto = (args) => {
+    if (args.code === '5698-DELIV') throw new TypeError('Failed to construct Blob');
+    return realUpload(args);
+  };
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.deepEqual([result.outcome, result.sent, result.failed], ['done', 1, 1]);
+  const [kept] = await store.listSessions();
+  assert.deepEqual([kept.code, kept.status, kept.lastErrorKind], ['5698-DELIV', 'failed', 'internal']);
+  assert.match(kept.lastError, /Failed to construct Blob/);
+  assert.equal((await store.getPhotos(kept.sessionId))[0].bytes.byteLength > 0, true, 'its photo is still on the iPad');
+});
+
+test('a damaged queued record (photo data missing) is reported as "Session format invalid", kept, and does not block the next', async () => {
+  const { indexedDB, store, service } = await setup();
+  const damaged = sessionFor('5698-DELIV');
+  await store.saveSession(damaged, photos(2, 'dmg'));
+  await store.saveSession(sessionFor('5699-DELIV'), photos(1, 'fine'));
+  // Damage it the way an interrupted older version might have: one photo not
+  // uploaded yet but with no bytes.
+  await new Promise((resolve, reject) => {
+    const open = indexedDB.open(Queue.DB_NAME);
+    open.onsuccess = () => {
+      const tx = open.result.transaction('photos', 'readwrite');
+      const idx = tx.objectStore('photos').index('sessionId').getAll(damaged.sessionId);
+      idx.onsuccess = () => tx.objectStore('photos').put({ ...idx.result.find((p) => p.position === 0), bytes: null });
+      tx.oncomplete = () => {
+        open.result.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.deepEqual([result.sent, result.failed], [1, 1]);
+  const [kept] = await store.listSessions();
+  assert.equal(kept.lastErrorKind, 'format');
+  assert.equal(Queue.failureLabel(kept.lastErrorKind), 'Session format invalid');
+  assert.match(kept.lastError, /photograph 1 has no image data/);
+  assert.equal(service.uploads.length, 1, 'none of the damaged session was sent');
+});
+
+test('Photo Service not reachable: Send reports why, and every pending session records that reason', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1));
+  service.checkService = async () => ({ reachable: false, paired: false, kind: 'unreachable', reason: 'Could not connect to door-tracker.local:8443 (Load failed)' });
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.deepEqual([result.outcome, result.kind], ['unreachable', 'unreachable']);
+  assert.match(result.reason, /door-tracker\.local:8443/);
+  const [s] = await store.listSessions();
+  assert.equal(s.status, Queue.STATUS.PENDING, 'still just waiting');
+  assert.equal(s.lastErrorKind, 'unreachable');
+  assert.match(s.lastError, /door-tracker\.local/);
+});
+
+test('the PC answering the check with an HTTP error is reported with its status, not as "not reachable", and nothing is touched', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(1));
+  service.checkService = async () => ({ reachable: true, ok: false, paired: false, status: 500 });
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.deepEqual([result.outcome, result.status, result.kind], ['service_error', 500, 'server']);
+  assert.equal(result.reason, 'Server returned 500');
+  const [s] = await store.listSessions();
+  assert.equal(s.status, Queue.STATUS.PENDING, 'a server error is not a pairing problem');
+  assert.equal(service.uploads.length, 0);
+});
+
+test('every HTTP failure the PC can give is shown as its own reason', () => {
+  const cases = [
+    [401, 'Authentication failed'],
+    [403, 'Paired for a different kind of photo'],
+    [404, 'Not recognised by the Photo Service'],
+    [409, 'Refused by the Photo Service'],
+    [429, 'Photo Service busy'],
+    [500, 'Server returned 500'],
+    [502, 'Network drive unavailable'],
+    [507, 'Network drive unavailable']
+  ];
+  for (const [status, label] of cases) assert.equal(Queue.failureLabel(Queue.classifyHttpStatus(status), status), label, String(status));
+  assert.equal(Queue.failureLabel('timeout'), 'Upload timed out');
+  assert.equal(Queue.failureLabel('unreachable'), 'Photo Service unreachable');
+  assert.equal(Queue.failureLabel('pairing'), 'Pairing required');
+});
+
+test('a photo refused with 502 (drive unavailable) records the kind and status on the kept session', async () => {
+  const { store, service } = await setup();
+  const shots = photos(1);
+  await store.saveSession(sessionFor('5698-DELIV'), shots);
+  service.uploadPhoto = async () => ({ ok: false, status: 502, error: 'The network drive could not be reached.' });
+  await Queue.createSyncEngine({ store, api: service }).syncAll();
+  const [s] = await store.listSessions();
+  assert.deepEqual([s.status, s.lastErrorKind, s.lastHttpStatus], ['failed', 'drive', 502]);
+  assert.ok(s.lastErrorAt);
+});
+
+test('sync diagnostics log each step - and never a token or photo bytes', async () => {
+  const { store, service } = await setup();
+  await store.saveSession(sessionFor('5698-DELIV'), photos(2));
+  service.checkService = async () => ({ reachable: true, ok: true, paired: true, role: 'delivery', url: 'https://door-tracker.local:8443/api/pair/check', authState: 'present', status: 200 });
+  const sink = logSink();
+  await Queue.createSyncEngine({ store, api: service, log: sink.log }).syncAll({ reason: 'button' });
+  assert.deepEqual(sink.events(), ['sync-start', 'queue-read', 'health', 'session-selected', 'upload-start', 'upload-result', 'upload-start', 'upload-result', 'complete-start', 'complete-result', 'session-result', 'sync-end']);
+  const health = sink.lines.find((l) => l.event === 'health');
+  assert.deepEqual([health.url, health.auth, health.status], ['https://door-tracker.local:8443/api/pair/check', 'present', 200]);
+  assert.equal(sink.lines.find((l) => l.event === 'queue-read').sessions, 1);
+  const text = JSON.stringify(sink.lines);
+  assert.doesNotMatch(text, /Bearer|token"|"bytes":\{|ArrayBuffer/i);
+  assert.equal(sink.lines.find((l) => l.event === 'sync-end').outcome, 'done');
+});
+
+test('records from the first offline version (no role, no code, even no createdAt) still list and send', async () => {
+  const { indexedDB, service } = await setup();
+  // Written exactly as the original offline version wrote them, straight
+  // into IndexedDB - before roles existed - and one without createdAt.
+  const ids = [randomUUID(), randomUUID()];
+  const shots = [photos(1, 'old1')[0], photos(1, 'old2')[0]];
+  const store = await Queue.openStore({ indexedDB });
+  await new Promise((resolve, reject) => {
+    const open = indexedDB.open(Queue.DB_NAME);
+    open.onsuccess = () => {
+      const tx = open.result.transaction(['sessions', 'photos'], 'readwrite');
+      ids.forEach((sessionId, i) => {
+        const record = { sessionId, reference: `570${i}-DELIV`, orderNumber: `570${i}`, deliveryType: 'Full Delivery', partNo: '', photoCount: 1, totalBytes: shots[i].bytes.byteLength, capturedAt: '2026-09-01T10:00:00.000Z', queueOrder: 0, status: 'pending', attempts: 0, lastAttemptAt: '', lastError: '' };
+        if (i === 0) record.createdAt = '2026-09-01T10:00:00.000Z';
+        tx.objectStore('sessions').put(record);
+        tx.objectStore('photos').put({ photoId: shots[i].photoId, sessionId, position: 0, bytes: shots[i].bytes, sizeBytes: shots[i].bytes.byteLength, sha256: sha(shots[i].bytes), width: 1, height: 1, capturedAt: '2026-09-01T10:00:00.000Z', uploaded: false, uploadedAt: '' });
+      });
+      tx.oncomplete = () => {
+        open.result.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+  assert.equal((await store.listSessions()).length, 2, 'listing does not break on the missing createdAt');
+  const result = await Queue.createSyncEngine({ store, api: service }).syncAll();
+  assert.equal(result.sent, 2);
+  assert.deepEqual(service.uploads.map((u) => [u.role, u.code]).sort(), [['delivery', '5700-DELIV'], ['delivery', '5701-DELIV']]);
 });

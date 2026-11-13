@@ -51,6 +51,34 @@
       </div>
     </div>
     <span id="printer-test-result" class="status-message"></span>
+
+    <div class="door-print-section">
+      <h3>General Door Code Printing</h3>
+      <p class="hint">When a scanner on an enabled station scans an order's general door code (e.g. 5698-D or 5626-2-D), that order's labels print on the station's own printer. Set per station, not per COM port. The scan is still sent as normal; individual door (5698-D-01), frame and delivery codes never print.</p>
+      <div class="door-print-editor">
+        <div class="field">
+          <label for="door-print-station">Station</label>
+          <select id="door-print-station"></select>
+        </div>
+        <div class="field">
+          <label for="door-print-printer">Printer</label>
+          <select id="door-print-printer"></select>
+        </div>
+        <div class="field door-print-enable">
+          <label><input type="checkbox" id="door-print-enabled" /> Enable general door label printing</label>
+        </div>
+        <div class="field buttons">
+          <button id="door-print-save-btn">Save Station</button>
+          <button id="door-print-remove-btn">Remove</button>
+        </div>
+        <span id="door-print-saved" class="saved-flash"></span>
+      </div>
+      <p id="door-print-error" class="dp-save-error" hidden></p>
+      <table class="dp-devices door-print-table">
+        <thead><tr><th>Station</th><th>Status</th><th>Printer</th><th>Last trigger</th></tr></thead>
+        <tbody id="door-print-body"></tbody>
+      </table>
+    </div>
   </section>
 
   <!-- Shared autocomplete suggestions for the Manual Scan station field below (see .manual-scan-station-input) -->

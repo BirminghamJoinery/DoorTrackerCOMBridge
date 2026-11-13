@@ -346,6 +346,14 @@ html, body {
 .pending-item-status { font-size: 15px; font-weight: 600; color: var(--warn); }
 .pending-item-status.status-sending { color: var(--accent); }
 .pending-item-error { font-size: 14px; color: var(--danger); }
+.pending-item-reason { font-size: 15px; font-weight: 700; color: var(--danger); }
+.pending-sync-result { min-height: 1.2em; margin: 8px 0 0; font-size: 15px; font-weight: 600; }
+.pending-sync-result.result-error { color: var(--danger); }
+.pending-sync-result.result-ok { color: var(--accent); }
+.sync-diagnostics { margin: 16px 0; font-size: 14px; color: var(--text-dim); }
+.sync-diagnostics summary { cursor: pointer; font-weight: 600; }
+#sync-diagnostics-facts { white-space: pre-line; }
+.sync-log { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; font-size: 12px; background: rgba(127, 127, 127, 0.12); padding: 8px; border-radius: 6px; }
 .pending-item-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .pending-item-actions button { padding: 8px 14px; font-size: 15px; }
 

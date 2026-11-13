@@ -810,6 +810,149 @@ reprintTestBtn.addEventListener('click', async () => {
     : `Failed: ${result.error}`;
 });
 
+// ---- General Door Code Printing ----
+// Per-STATION rule (enabled + printer) for printing an order's labels when
+// that station scans its general door code - see general-door-trigger.js and
+// door-print-settings.js. Saved and validated in the main process; this is
+// only the editor and the status table.
+
+const doorPrintStationSelect = document.getElementById('door-print-station');
+const doorPrintPrinterSelect = document.getElementById('door-print-printer');
+const doorPrintEnabledInput = document.getElementById('door-print-enabled');
+const doorPrintSaveBtn = document.getElementById('door-print-save-btn');
+const doorPrintRemoveBtn = document.getElementById('door-print-remove-btn');
+const doorPrintSavedFlash = document.getElementById('door-print-saved');
+const doorPrintError = document.getElementById('door-print-error');
+const doorPrintBody = document.getElementById('door-print-body');
+
+let doorPrintSettings = { stations: [] };
+let installedPrinterNames = null; // null = cannot list printers on this platform
+const doorPrintLastOutcome = new Map(); // stationKey -> latest trigger outcome
+
+function doorPrintRule(stationKey) {
+  return doorPrintSettings.stations.find((row) => row.stationKey === stationKey) || null;
+}
+
+function describeDoorPrintOutcome(outcome) {
+  const time = new Date(outcome.at).toLocaleTimeString();
+  if (outcome.result === 'created') return `${time} ${outcome.order} (${outcome.portPath}) - print job created ${outcome.jobId}`;
+  if (outcome.result === 'suppressed') return `${time} ${outcome.order} - duplicate scan ignored`;
+  return `${time} ${outcome.order} - FAILED: ${outcome.reason}`;
+}
+
+function renderDoorPrintTable() {
+  doorPrintBody.innerHTML = '';
+  const rows = [...doorPrintSettings.stations].sort((a, b) => Number(b.enabled) - Number(a.enabled));
+  for (const rule of rows) {
+    const tr = document.createElement('tr');
+    const stationCell = document.createElement('td');
+    stationCell.textContent = STATION_LABELS.get(rule.stationKey) || rule.stationKey;
+    const statusCell = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = `badge ${rule.enabled ? 'connected' : 'disconnected'}`;
+    badge.textContent = rule.enabled ? 'Enabled' : 'Disabled';
+    statusCell.appendChild(badge);
+    const printerCell = document.createElement('td');
+    const missing = installedPrinterNames && rule.printerName && !installedPrinterNames.includes(rule.printerName);
+    printerCell.textContent = rule.printerName ? `${rule.printerName}${missing ? ' (not found on this PC)' : ''}` : '-';
+    if (missing) printerCell.className = 'failed';
+    const lastCell = document.createElement('td');
+    const outcome = doorPrintLastOutcome.get(rule.stationKey);
+    lastCell.textContent = outcome ? describeDoorPrintOutcome(outcome) : '-';
+    if (outcome && outcome.result === 'failed') lastCell.className = 'failed';
+    tr.append(stationCell, statusCell, printerCell, lastCell);
+    doorPrintBody.appendChild(tr);
+  }
+  const other = document.createElement('tr');
+  const cell = document.createElement('td');
+  cell.colSpan = 4;
+  cell.className = 'hint';
+  cell.textContent = rows.length > 0 ? 'Every other station: disabled.' : 'No station prints on general door codes yet.';
+  other.appendChild(cell);
+  doorPrintBody.appendChild(other);
+}
+
+// Shows the selected station's saved rule in the editor.
+function showDoorPrintRuleInEditor() {
+  const rule = doorPrintRule(doorPrintStationSelect.value);
+  doorPrintEnabledInput.checked = Boolean(rule && rule.enabled);
+  const printerName = rule ? rule.printerName : '';
+  if (printerName) ensureOptionExists(doorPrintPrinterSelect, printerName);
+  doorPrintPrinterSelect.value = printerName;
+  doorPrintRemoveBtn.disabled = !rule;
+}
+
+async function refreshDoorPrintPrinters() {
+  let result;
+  try {
+    result = await window.comBridge.listPrinters();
+  } catch {
+    result = { supported: true, printers: [] };
+  }
+  installedPrinterNames = result.supported ? result.printers.map((p) => p.name) : null;
+  doorPrintPrinterSelect.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = result.supported ? (result.printers.length ? 'Choose a printer' : 'No printers found') : 'Not available on this platform (Windows only)';
+  doorPrintPrinterSelect.appendChild(placeholder);
+  for (const printer of result.printers || []) {
+    const option = document.createElement('option');
+    option.value = printer.name;
+    option.textContent = printer.isOffline ? `${printer.name} (offline)` : printer.name;
+    doorPrintPrinterSelect.appendChild(option);
+  }
+  showDoorPrintRuleInEditor();
+  renderDoorPrintTable();
+}
+
+function showDoorPrintErrors(errors) {
+  doorPrintError.hidden = !errors || errors.length === 0;
+  doorPrintError.textContent = errors && errors.length ? errors.join(' ') : '';
+}
+
+async function saveDoorPrintStations(stations) {
+  const result = await window.comBridge.saveDoorPrintSettings({ stations });
+  if (!result.ok) {
+    showDoorPrintErrors(result.errors);
+    return;
+  }
+  showDoorPrintErrors(null);
+  doorPrintSettings = result.settings;
+  flashSaved(doorPrintSavedFlash);
+  showDoorPrintRuleInEditor();
+  renderDoorPrintTable();
+}
+
+doorPrintStationSelect.addEventListener('change', () => {
+  showDoorPrintErrors(null);
+  showDoorPrintRuleInEditor();
+});
+
+doorPrintSaveBtn.addEventListener('click', () => {
+  const stationKey = doorPrintStationSelect.value;
+  const row = { stationKey, enabled: doorPrintEnabledInput.checked, printerName: doorPrintPrinterSelect.value };
+  const others = doorPrintSettings.stations.filter((r) => r.stationKey !== stationKey);
+  saveDoorPrintStations([...others, row]);
+});
+
+doorPrintRemoveBtn.addEventListener('click', () => {
+  const stationKey = doorPrintStationSelect.value;
+  saveDoorPrintStations(doorPrintSettings.stations.filter((r) => r.stationKey !== stationKey));
+});
+
+printerRefreshBtn.addEventListener('click', () => refreshDoorPrintPrinters());
+
+window.comBridge.onGeneralDoorPrintEvent((outcome) => {
+  doorPrintLastOutcome.set(outcome.stationKey, outcome);
+  renderDoorPrintTable();
+});
+
+async function initDoorPrint() {
+  populateStationSelect(doorPrintStationSelect);
+  doorPrintSettings = await window.comBridge.getDoorPrintSettings();
+  await refreshDoorPrintPrinters();
+}
+
 // ---- Pinned tab buttons (Dashboard, Delivery Photos - always present, not closable) ----
 
 pinnedTabs.set('dashboard', { panel: dashboardPanel, button: buildPinnedTabButton('dashboard', 'Dashboard') });
@@ -905,6 +1048,7 @@ async function init() {
 
   await refreshPrinterList();
   await checkConfiguredPrinterStatus();
+  await initDoorPrint();
 }
 
 init();

@@ -231,7 +231,9 @@
     async function listSessions() {
       const tx = db.transaction(SESSIONS, 'readonly');
       const sessions = await requestToPromise(tx.objectStore(SESSIONS).getAll());
-      return sessions.sort((a, b) => (a.queueOrder || 0) - (b.queueOrder || 0) || a.createdAt.localeCompare(b.createdAt));
+      // Tolerates records missing either field (an older or damaged record
+      // must still be listed, never break the whole list).
+      return sessions.sort((a, b) => (a.queueOrder || 0) - (b.queueOrder || 0) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
     }
 
     // Read-modify-write inside ONE transaction, using plain callbacks rather
@@ -318,20 +320,100 @@
 
   // ---- sending --------------------------------------------------------------
 
+  // Why a send did not succeed, as one of a small fixed set of kinds - so the
+  // Pending screen can say what is actually wrong ("Authentication failed",
+  // "Server returned 500") instead of a generic "waiting". Stored on the
+  // session as lastErrorKind, beside the server's own message in lastError.
+  const FAILURE_LABELS = {
+    unreachable: 'Photo Service unreachable',
+    timeout: 'Upload timed out',
+    auth: 'Authentication failed',
+    pairing: 'Pairing required',
+    wrong_role: 'Paired for a different kind of photo',
+    format: 'Session format invalid',
+    drive: 'Network drive unavailable',
+    server: 'Server error',
+    busy: 'Photo Service busy',
+    rejected: 'Refused by the Photo Service',
+    not_found: 'Not recognised by the Photo Service',
+    storage: 'Could not read this delivery from the iPad',
+    internal: 'Unexpected error on the iPad'
+  };
+
+  // HTTP status -> kind, for any answer the Photo Service gives.
+  function classifyHttpStatus(status) {
+    if (status === 401) return 'auth';
+    if (status === 403) return 'wrong_role';
+    if (status === 404 || status === 405) return 'not_found';
+    if (status === 429) return 'busy';
+    if (status === 502 || status === 507) return 'drive';
+    if (status >= 500) return 'server';
+    if (status >= 400) return 'rejected';
+    return 'server';
+  }
+
+  // A one-line, human reason: "Server returned 500: Something went wrong."
+  function failureLabel(kind, status) {
+    if (kind === 'server' && status) return `Server returned ${status}`;
+    return FAILURE_LABELS[kind] || FAILURE_LABELS.internal;
+  }
+
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+  const ROLES = ['delivery', 'bench', 'ironmongery'];
+
+  // Checks a queued session (any version of the record: sessions queued
+  // before photo roles existed have no role/code and are read as the
+  // Delivery they were) is complete enough to send. Returns '' or the
+  // problem. A session that fails this is kept and marked - never deleted.
+  function sessionProblem(session, photos) {
+    if (!session || typeof session !== 'object') return 'the record is empty';
+    if (!session.sessionId || !UUID_PATTERN.test(String(session.sessionId))) return 'it has no valid session id';
+    if (!ROLES.includes(sessionRole(session))) return `unknown photo role "${String(session.role).slice(0, 20)}"`;
+    const code = sessionCode(session);
+    if (typeof code !== 'string' || !code.trim()) return 'it has no scanned code';
+    if (!Array.isArray(photos) || photos.length === 0) return 'it has no photographs stored';
+    for (let i = 0; i < photos.length; i++) {
+      const p = photos[i];
+      if (!p || !p.photoId || !UUID_PATTERN.test(String(p.photoId))) return `photograph ${i + 1} has no valid id`;
+      if (p.uploaded) continue;
+      if (!(p.bytes instanceof ArrayBuffer) || p.bytes.byteLength === 0) return `photograph ${i + 1} has no image data`;
+      if (!SHA256_PATTERN.test(String(p.sha256 || ''))) return `photograph ${i + 1} has no checksum`;
+    }
+    return '';
+  }
+
+  // Any API call that has not answered after `ms` is treated as timed out,
+  // whatever the browser did with the request - so one stuck request can
+  // never freeze sending for the rest of the page's life (the original
+  // "SEND PENDING NOW does nothing" failure).
+  function withDeadline(promise, ms, what) {
+    let timer;
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, unreachable: true, timedOut: true, kind: 'timeout', error: `No answer from the Photo Service within ${Math.round(ms / 1000)} s (${what}).` }), ms);
+    });
+    return Promise.race([Promise.resolve(promise), deadline]).finally(() => clearTimeout(timer));
+  }
+
+  const DEFAULT_DEADLINES = { check: 20000, upload: 90000, complete: 30000 };
+
   // The sync engine. `api` talks to the Windows Photo Service and is injected
   // (the browser passes real fetch/XHR calls; tests pass fakes or a Node
   // client for a real test server):
-  //   checkService()                         -> { reachable, paired, role }
+  //   checkService()  -> { reachable, paired, role, ok?, status?, kind?, reason?, url?, authState? }
   //   uploadPhoto({ role, code, photoId, bytes, sha256 })
-  //                                          -> { ok } | { ok: false, error, needsPairing?, wrongRole?, unreachable? }
+  //                   -> { ok } | { ok: false, error, status?, kind?, needsPairing?, wrongRole?, unreachable?, timedOut? }
   //   completeSession({ sessionId, role, code, photosSaved })
-  //                                          -> same shape
+  //                   -> same shape
   // `role` is only the role the session was TAKEN as, sent so the PC can
   // refuse it clearly if this iPad is now paired as something else - the PC
   // always decides the role itself, from the pairing token.
   // `withLock(fn)` (optional) serialises sending across browser tabs - see
   // app.js, which passes the Web Locks API when the browser has it.
-  function createSyncEngine({ store, api, onProgress = () => {}, withLock = (fn) => fn() }) {
+  // `log(event, details)` (optional) receives a diagnostic line per step -
+  // never a token, never photo bytes.
+  function createSyncEngine({ store, api, onProgress = () => {}, withLock = (fn) => fn(), log = () => {}, deadlines = {} }) {
+    const limits = { ...DEFAULT_DEADLINES, ...deadlines };
     let running = null;
 
     function progress(update) {
@@ -342,117 +424,228 @@
       }
     }
 
-    async function failSession(session, status, error) {
-      await store.updateSession(session.sessionId, { status, lastError: String(error || '').slice(0, 300) });
+    function note(event, details) {
+      try {
+        log(event, details || {});
+      } catch {
+        // diagnostics must never break sending
+      }
+    }
+
+    // Kind of a failed API result (an explicit kind from the api wins).
+    function kindOf(result) {
+      if (result.kind) return result.kind;
+      if (result.needsPairing) return 'auth';
+      if (result.wrongRole) return 'wrong_role';
+      if (result.timedOut) return 'timeout';
+      if (result.unreachable) return 'unreachable';
+      if (result.status) return classifyHttpStatus(result.status);
+      return 'rejected';
+    }
+
+    async function failSession(session, status, error, kind, httpStatus) {
+      await store.updateSession(session.sessionId, {
+        status,
+        lastError: String(error || '').slice(0, 300),
+        lastErrorKind: kind || '',
+        lastHttpStatus: httpStatus || 0,
+        lastErrorAt: new Date().toISOString()
+      });
+    }
+
+    function checkService() {
+      return withDeadline(api.checkService(), limits.check, 'reachability check').then((r) => (r && r.timedOut ? { reachable: false, paired: false, kind: 'timeout', reason: r.error } : r));
     }
 
     // Sends ONE session: every not-yet-uploaded photo in order, then the
     // session-complete report, then (only then) deletes it locally.
+    // Resolves { outcome: 'sent' | 'failed' | 'needs_pairing' | 'unreachable', kind, error }.
     async function sendSession(session, pairedRole) {
       const role = sessionRole(session);
       const code = sessionCode(session);
       // Taken as one role, but this iPad has since been paired as another:
       // never sent (the PC would refuse it anyway), never deleted.
       if (pairedRole && pairedRole !== role) {
-        await failSession(session, STATUS.WRONG_ROLE, `Taken as ${role} photos, but this iPad is now paired for ${pairedRole} photos.`);
-        return { outcome: 'failed' };
+        const error = `Taken as ${role} photos, but this iPad is now paired for ${pairedRole} photos.`;
+        await failSession(session, STATUS.WRONG_ROLE, error, 'wrong_role');
+        return { outcome: 'failed', kind: 'wrong_role', error };
+      }
+      let photos;
+      try {
+        photos = await store.getPhotos(session.sessionId);
+      } catch (err) {
+        const error = `Could not read its photographs from this iPad (${(err && err.message) || err}).`;
+        await failSession(session, STATUS.FAILED, error, 'storage');
+        return { outcome: 'failed', kind: 'storage', error };
+      }
+      const problem = sessionProblem(session, photos);
+      if (problem) {
+        const error = `Session format invalid: ${problem}. Its photographs are kept on this iPad.`;
+        await failSession(session, STATUS.FAILED, error, 'format');
+        note('session-invalid', { sessionId: session.sessionId, code, problem });
+        return { outcome: 'failed', kind: 'format', error };
       }
       await store.updateSession(session.sessionId, { status: STATUS.SYNCING, lastAttemptAt: new Date().toISOString(), attempts: (session.attempts || 0) + 1 });
-      const photos = await store.getPhotos(session.sessionId);
-      if (photos.length === 0) {
-        await failSession(session, STATUS.FAILED, 'This delivery has no photographs stored.');
-        return { outcome: 'failed' };
-      }
 
       let failure = null;
       for (let i = 0; i < photos.length; i++) {
         const photo = photos[i];
         if (photo.uploaded) continue;
         progress({ sessionId: session.sessionId, reference: code, sending: i + 1, total: photos.length });
-        const result = await api.uploadPhoto({ role, code, photoId: photo.photoId, bytes: photo.bytes, sha256: photo.sha256 });
+        note('upload-start', { sessionId: session.sessionId, code, photo: i + 1, of: photos.length, bytes: photo.bytes.byteLength });
+        const result = await withDeadline(api.uploadPhoto({ role, code, photoId: photo.photoId, bytes: photo.bytes, sha256: photo.sha256 }), limits.upload, 'photo upload');
+        note('upload-result', { sessionId: session.sessionId, photo: i + 1, ok: Boolean(result.ok), status: result.status || 0, kind: result.ok ? '' : kindOf(result), error: result.ok ? '' : result.error });
         if (result.ok) {
           await store.markPhotoUploaded(photo.photoId);
           continue;
         }
+        const kind = kindOf(result);
         if (result.needsPairing) {
-          await failSession(session, STATUS.NEEDS_PAIRING, result.error);
-          return { outcome: 'needs_pairing' };
+          await failSession(session, STATUS.NEEDS_PAIRING, result.error, kind, result.status);
+          return { outcome: 'needs_pairing', kind, error: result.error };
         }
         if (result.wrongRole) {
-          await failSession(session, STATUS.WRONG_ROLE, result.error);
-          return { outcome: 'failed' };
+          await failSession(session, STATUS.WRONG_ROLE, result.error, kind, result.status);
+          return { outcome: 'failed', kind, error: result.error };
         }
         if (result.unreachable) {
-          // Lost the connection part-way: back to plain "waiting", nothing lost.
-          await failSession(session, STATUS.PENDING, result.error);
-          return { outcome: 'unreachable' };
+          // Lost the connection (or this upload timed out) part-way: back to
+          // plain "waiting", nothing lost - the uploaded photos stay marked.
+          await failSession(session, STATUS.PENDING, result.error, kind, result.status);
+          return { outcome: 'unreachable', kind, error: result.error };
         }
         // The PC answered but refused or could not file this photo (drive
         // offline, out of space...). Keep going with the rest - they can
         // still be filed - but this session cannot be completed this time.
-        failure = failure || result.error;
+        failure = failure || { error: result.error, kind, status: result.status };
       }
       if (failure) {
-        await failSession(session, STATUS.FAILED, failure);
-        return { outcome: 'failed' };
+        await failSession(session, STATUS.FAILED, failure.error, failure.kind, failure.status);
+        return { outcome: 'failed', kind: failure.kind, error: failure.error };
       }
 
       progress({ sessionId: session.sessionId, reference: code, completing: true });
-      const done = await api.completeSession({ sessionId: session.sessionId, role, code, photosSaved: photos.length });
+      note('complete-start', { sessionId: session.sessionId, code, photosSaved: photos.length });
+      const done = await withDeadline(api.completeSession({ sessionId: session.sessionId, role, code, photosSaved: photos.length }), limits.complete, 'session-complete report');
+      note('complete-result', { sessionId: session.sessionId, ok: Boolean(done.ok), status: done.status || 0, kind: done.ok ? '' : kindOf(done), error: done.ok ? '' : done.error });
       if (!done.ok) {
+        const kind = kindOf(done);
         if (done.needsPairing) {
-          await failSession(session, STATUS.NEEDS_PAIRING, done.error);
-          return { outcome: 'needs_pairing' };
+          await failSession(session, STATUS.NEEDS_PAIRING, done.error, kind, done.status);
+          return { outcome: 'needs_pairing', kind, error: done.error };
         }
         if (done.wrongRole) {
-          await failSession(session, STATUS.WRONG_ROLE, done.error);
-          return { outcome: 'failed' };
+          await failSession(session, STATUS.WRONG_ROLE, done.error, kind, done.status);
+          return { outcome: 'failed', kind, error: done.error };
         }
-        await failSession(session, done.unreachable ? STATUS.PENDING : STATUS.FAILED, done.error);
-        return { outcome: done.unreachable ? 'unreachable' : 'failed' };
+        await failSession(session, done.unreachable ? STATUS.PENDING : STATUS.FAILED, done.error, kind, done.status);
+        return { outcome: done.unreachable ? 'unreachable' : 'failed', kind, error: done.error };
       }
 
+      // Every photo came back 201 (filed and read back by the PC) and the PC
+      // acknowledged the session: only now is the local copy removed.
       await store.deleteSession(session.sessionId);
       return { outcome: 'sent' };
     }
 
-    // Sends every queued session, oldest first, one at a time. Stops early
-    // (leaving everything still queued) if the Photo Service cannot be
-    // reached or this iPad is no longer paired. Overlapping calls share the
-    // one run already in progress. Resolves { outcome, sent, failed }:
-    // outcome is 'nothing' | 'unreachable' | 'needs_pairing' | 'done' | 'busy'.
-    function syncAll({ onlySessionId } = {}) {
-      if (running) return running;
+    // Sends every queued session, oldest first, one at a time. One session
+    // that fails - refused, invalid, even throwing - is marked and skipped;
+    // the rest are still sent. Stops early (leaving everything still queued)
+    // only if the Photo Service itself cannot be reached or this iPad is no
+    // longer paired. Overlapping calls share the one run already in progress
+    // (and every call inside is time-limited, so that run always ends).
+    // Resolves { outcome, sent, failed, deferred, kind?, reason?, status? }:
+    // outcome is 'nothing' | 'unreachable' | 'service_error' | 'needs_pairing'
+    // | 'done' | 'busy' | 'storage_error'.
+    function syncAll({ onlySessionId, reason = '' } = {}) {
+      if (running) {
+        note('sync-joined', { reason });
+        return running;
+      }
       running = (async () => {
+        note('sync-start', { reason, onlySessionId: onlySessionId || '' });
         try {
           const result = await withLock(async () => {
-            let sessions = await store.listSessions();
+            let sessions;
+            try {
+              sessions = await store.listSessions();
+            } catch (err) {
+              return { outcome: 'storage_error', sent: 0, failed: 0, deferred: 0, kind: 'storage', reason: `Could not read the pending list from this iPad (${(err && err.message) || err}).` };
+            }
             if (onlySessionId) sessions = sessions.filter((s) => s.sessionId === onlySessionId);
-            if (sessions.length === 0) return { outcome: 'nothing', sent: 0, failed: 0 };
+            note('queue-read', { sessions: sessions.length });
+            if (sessions.length === 0) return { outcome: 'nothing', sent: 0, failed: 0, deferred: 0 };
 
-            const service = await api.checkService();
-            if (!service.reachable) return { outcome: 'unreachable', sent: 0, failed: 0 };
+            const service = await checkService();
+            note('health', { reachable: Boolean(service.reachable), paired: Boolean(service.paired), status: service.status || 0, kind: service.kind || '', reason: service.reason || '', url: service.url || '', auth: service.authState || '' });
+            if (!service.reachable) {
+              const kind = service.kind || 'unreachable';
+              const why = service.reason || failureLabel(kind);
+              for (const s of sessions) {
+                await store.updateSession(s.sessionId, { lastError: why.slice(0, 300), lastErrorKind: kind, lastHttpStatus: 0, lastErrorAt: new Date().toISOString() }).catch(() => {});
+              }
+              return { outcome: 'unreachable', sent: 0, failed: 0, deferred: sessions.length, kind, reason: why };
+            }
+            if (service.ok === false) {
+              // It answered, but with an error - say exactly what.
+              const kind = service.kind || classifyHttpStatus(service.status);
+              return { outcome: 'service_error', sent: 0, failed: 0, deferred: sessions.length, kind, status: service.status, reason: service.reason || failureLabel(kind, service.status) };
+            }
             if (!service.paired) {
-              for (const s of sessions) await failSession(s, STATUS.NEEDS_PAIRING, 'This iPad needs to be paired again.');
-              return { outcome: 'needs_pairing', sent: 0, failed: 0 };
+              const why = service.authState === 'missing' ? 'This iPad has no pairing saved - pair it again.' : 'The Photo Service no longer recognises this iPad\'s pairing - pair it again.';
+              for (const s of sessions) await failSession(s, STATUS.NEEDS_PAIRING, why, 'pairing');
+              return { outcome: 'needs_pairing', sent: 0, failed: 0, deferred: sessions.length, kind: 'pairing', reason: why };
             }
 
             let sent = 0;
             let failed = 0;
-            for (const session of sessions) {
-              const r = await sendSession(session, service.role);
+            let deferred = 0;
+            for (let index = 0; index < sessions.length; index++) {
+              const session = sessions[index];
+              note('session-selected', { sessionId: session.sessionId, code: sessionCode(session), role: sessionRole(session), status: session.status, attempts: session.attempts || 0 });
+              let r;
+              try {
+                r = await sendSession(session, service.role);
+              } catch (err) {
+                // Something about THIS session broke the iPad side (a damaged
+                // record, a storage error...). Mark it and carry on - it must
+                // never stop the deliveries behind it.
+                const error = `Could not send this ${sessionRole(session)} session: ${(err && err.message) || err}`;
+                await failSession(session, STATUS.FAILED, error, 'internal').catch(() => {});
+                r = { outcome: 'failed', kind: 'internal', error };
+              }
+              note('session-result', { sessionId: session.sessionId, outcome: r.outcome, kind: r.kind || '', error: r.error || '' });
               if (r.outcome === 'sent') sent++;
               else if (r.outcome === 'failed') failed++;
-              else return { outcome: r.outcome, sent, failed };
+              else if (r.outcome === 'needs_pairing') {
+                note('retry-decision', { decision: 'stop', why: 'pairing rejected - every session would be refused' });
+                return { outcome: 'needs_pairing', sent, failed, deferred: sessions.length - index, kind: r.kind, reason: r.error };
+              } else {
+                // Unreachable or timed out on this session. Is the Photo
+                // Service really gone, or was it just this one?
+                deferred++;
+                const again = await checkService();
+                if (again.reachable && again.paired && again.ok !== false) {
+                  note('retry-decision', { decision: 'continue', why: `${r.kind || 'unreachable'} on this session, but the Photo Service still answers - trying the next one` });
+                  continue;
+                }
+                note('retry-decision', { decision: 'stop', why: 'the Photo Service stopped answering' });
+                return { outcome: 'unreachable', sent, failed, deferred: deferred + (sessions.length - index - 1), kind: r.kind || 'unreachable', reason: r.error };
+              }
             }
-            return { outcome: 'done', sent, failed };
+            return { outcome: 'done', sent, failed, deferred };
           });
-          return result || { outcome: 'busy', sent: 0, failed: 0 };
+          return result || { outcome: 'busy', sent: 0, failed: 0, deferred: 0, reason: 'Another copy of this tool on this iPad is already sending.' };
+        } catch (err) {
+          return { outcome: 'storage_error', sent: 0, failed: 0, deferred: 0, kind: 'internal', reason: `Sending stopped unexpectedly (${(err && err.message) || err}).` };
         } finally {
           running = null;
           progress(null);
         }
-      })();
+      })().then((result) => {
+        note('sync-end', result);
+        return result;
+      });
       return running;
     }
 
@@ -492,5 +685,5 @@
     };
   }
 
-  return { DB_NAME, STATUS, HIGH_USAGE_FRACTION, openStore, deliveryMetadata, sessionMetadata, sessionRole, sessionCode, sha256Hex, assessStorage, formatBytes, createSyncEngine, installAutoSync };
+  return { DB_NAME, STATUS, HIGH_USAGE_FRACTION, FAILURE_LABELS, openStore, deliveryMetadata, sessionMetadata, sessionRole, sessionCode, sessionProblem, classifyHttpStatus, failureLabel, sha256Hex, assessStorage, formatBytes, createSyncEngine, installAutoSync };
 });
