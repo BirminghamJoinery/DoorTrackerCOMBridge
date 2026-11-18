@@ -86,7 +86,8 @@ test('only exact plain file names are ever removed - never a path outside the fo
 });
 
 test('main.js runs the cleanup on start-up inside a guard, against the user-data folder', () => {
-  const main = fs.readFileSync(nodePath.join(SRC, 'main.js'), 'utf8');
+  // Normalise line endings: Windows CI checks the source out with CRLF.
+  const main = fs.readFileSync(nodePath.join(SRC, 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert.match(main, /app\.whenReady\(\)\.then\(\(\) => \{\n[^]*?try \{\n\s+removeRetiredFiles\(\{ dir: app\.getPath\('userData'\), logger: comLogger \}\);\n\s+\} catch \{/);
 });
 

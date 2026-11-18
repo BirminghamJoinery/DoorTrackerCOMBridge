@@ -11,7 +11,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const nodePath = require('node:path');
 
-const read = (name) => fs.readFileSync(nodePath.join(__dirname, name), 'utf8');
+// Line endings normalised: Windows CI checks the source out with CRLF.
+const read = (name) => fs.readFileSync(nodePath.join(__dirname, name), 'utf8').replace(/\r\n/g, '\n');
 const main = read('main.js');
 const preload = read('preload.js');
 const renderer = read('renderer.js');
