@@ -1,12 +1,17 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 const { fork } = require('child_process');
 const { SerialPort } = require('serialport');
-const { deriveApiBase, fetchPendingJobs, reprintJob, createOrderLabelJob } = require('./print-job-client');
-const { createGeneralDoorTrigger, runScanActions, jobStationKey } = require('./general-door-trigger');
-const doorPrintSettings = require('./door-print-settings');
+const { deriveApiBase, fetchPendingJobs, reprintJob, fetchTempLabelSource } = require('./print-job-client');
+const { runScanActions } = require('./scan-actions');
+const tempLabelSettings = require('./temp-labels/settings');
+const { createTempLabelSource } = require('./temp-labels/source-cache');
+const { createTempLabelTrigger, createPrinterCheck } = require('./temp-labels/trigger');
+const { MAX_TEMP_LABELS_PER_SCAN } = require('./temp-labels/codes');
+const { createAccessKeyStore } = require('./temp-labels/access-key');
+const { removeRetiredFiles } = require('./retired-files');
 const { STATIONS } = require('./com-options');
 const { PrintJobProcessor } = require('./print-job-processor');
 const { createPrintAttemptStore } = require('./print-attempt-store');
@@ -63,51 +68,60 @@ const printProcessor = new PrintJobProcessor({
   priorAttemptStore: printAttemptStore
 });
 
-// ---- General Door Code Printing ----
-//
-// A scanner at a station configured for it scans an order's general door
-// code ("5698-D", "5626-2-D") -> the website creates that order's normal
-// label job -> the SAME printProcessor above prints it, addressed to that
-// station's own printer. See general-door-trigger.js. Rules are per station
-// (door-print-settings.json in userData) and read fresh on every matching
-// scan, so a printer change applies to the very next scan.
-const DOOR_PRINT_SETTINGS_PATH = () => path.join(app.getPath('userData'), 'door-print-settings.json');
 const STATION_NAMES = new Map(STATIONS.map((s) => [s.key, s.label]));
 
-function loadDoorPrintSettings() {
-  return doorPrintSettings.loadDoorPrintSettings(DOOR_PRINT_SETTINGS_PATH());
+// ---- Temporary Data Matrix Printing ----
+//
+// A scanner at a station configured for it scans an order's general door
+// code ("5698-D", "5626-2-D") -> the order's quantity is read from the LOCAL
+// source cache -> that many temporary labels (5698-T-01, 5698-T-02, ...), one
+// centred Data Matrix each, print on the station's own USB printer as one raw
+// ZPL job. See temp-labels/. Settings are read fresh on every matching scan.
+//
+// The source cache is refreshed from the website's GET /api/temp-labels (the
+// Google Sheet, read with the website's existing service account) at start-up,
+// every 5 minutes and on "Refresh Label Data"; scans never wait on it.
+const TEMP_LABEL_SETTINGS_PATH = () => path.join(app.getPath('userData'), 'temp-label-settings.json');
+const TEMP_LABELS_CACHE_PATH = () => path.join(app.getPath('userData'), 'temp-labels-cache.json');
+const TEMP_LABELS_KEY_PATH = () => path.join(app.getPath('userData'), 'temp-labels-access-key.json');
+
+// The key GET /api/temp-labels requires (see temp-labels/access-key.js),
+// encrypted with Windows DPAPI via safeStorage. Never logged, never sent to
+// the renderer - only its SHA-256 is shown, for TEMP_LABELS_KEY_SHA256.
+const tempLabelAccessKey = createAccessKeyStore({
+  filePath: TEMP_LABELS_KEY_PATH(),
+  isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+  encrypt: (text) => safeStorage.encryptString(text),
+  decrypt: (buffer) => safeStorage.decryptString(buffer)
+});
+
+function loadTempLabelSettings() {
+  return tempLabelSettings.loadTempLabelSettings(TEMP_LABEL_SETTINGS_PATH());
 }
 
-// The station's printer must exist and be online right now - never a
-// fallback to the main printer or the Windows default.
-async function checkStationPrinter(printerName) {
-  const status = await windowsPrinter.getPrinterStatus(printerName);
-  if (!status.supported) return { ok: false, reason: `Printer unavailable - printing is only implemented on Windows (this is ${process.platform})` };
-  if (!status.found) return { ok: false, reason: `Printer unavailable - "${printerName}" was not found on this PC` };
-  if (status.offline) return { ok: false, reason: `Printer unavailable - "${printerName}" is offline` };
-  return { ok: true };
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
 
-function sendGeneralDoorPrintEvent(outcome) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    const { apiUrl, ...safe } = outcome; // nothing the UI needs, kept out of the renderer
-    mainWindow.webContents.send('general-door-print-event', { ...safe, at: new Date().toISOString() });
-  }
-}
+// Exactly the configured printer, or nothing - see createPrinterCheck().
+const checkTempLabelPrinter = createPrinterCheck((name) => windowsPrinter.getPrinterStatus(name));
 
-const generalDoorTrigger = createGeneralDoorTrigger({
-  getRule: (stationKey) => doorPrintSettings.ruleForStation(loadDoorPrintSettings(), stationKey),
-  checkPrinter: checkStationPrinter,
-  createJob: async ({ order, stationKey, portPath, apiUrl }) => {
-    const apiBase = deriveApiBase(apiUrl);
-    if (!apiBase) return { ok: false, error: 'No API URL configured.' };
-    const result = await createOrderLabelJob(apiBase, { order, stationKey: jobStationKey(stationKey), device: portPath, source: 'combridge_general_door' });
-    return result.ok ? { ok: true, job: result.job, apiBase } : result;
-  },
-  enqueue: (job, apiBase, options) => printProcessor.enqueue(job, apiBase, options),
+const tempLabelSource = createTempLabelSource({
+  cachePath: TEMP_LABELS_CACHE_PATH(),
+  fetchRows: () => fetchTempLabelSource(deriveApiBase(loadSettingsFromDisk().apiUrl), tempLabelAccessKey.getKey()),
+  logger: comLogger,
+  onStatus: (status) => sendToRenderer('temp-label-source-status', status)
+});
+
+const tempLabelTrigger = createTempLabelTrigger({
+  getRule: (stationKey) => tempLabelSettings.ruleForStation(loadTempLabelSettings(), stationKey),
+  lookupOrder: (order) => tempLabelSource.lookup(order),
+  getLayout: () => loadTempLabelSettings().layout,
+  checkPrinter: checkTempLabelPrinter,
+  sendRaw: (printerName, buffer, options) => windowsPrinter.sendRawData(printerName, buffer, options),
   logger: comLogger,
   stationLabel: (key) => STATION_NAMES.get(key) || key,
-  onOutcome: sendGeneralDoorPrintEvent
+  onOutcome: (outcome) => sendToRenderer('temp-label-event', outcome)
 });
 
 // ---- Delivery Photos ----
@@ -287,6 +301,14 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Settings files of retired features (see retired-files.js). Never throws;
+  // the extra guard only makes sure nothing here can ever block start-up.
+  try {
+    removeRetiredFiles({ dir: app.getPath('userData'), logger: comLogger });
+  } catch {
+    // ignored
+  }
+
   createWindow();
   // Delivery Photos starts with the app, the same way it is offered in the UI
   // ("Automatic start of photo service") - only if it has actually been set
@@ -303,6 +325,10 @@ app.whenReady().then(() => {
   syncPendingTrackingEvents().catch(() => {});
   const trackingSyncTimer = setInterval(() => syncPendingTrackingEvents().catch(() => {}), TRACKING_SYNC_INTERVAL_MS);
   trackingSyncTimer.unref();
+
+  // Temporary-label source: refresh now, then every 5 minutes. The cache
+  // already loaded from disk is used meanwhile (and if this fails).
+  tempLabelSource.start();
 });
 
 app.on('window-all-closed', () => {
@@ -371,8 +397,8 @@ function sendScan(tabId, portPath, value) {
   // called with an undefined scan context.
   if (!conn) return;
 
-  // The scan is submitted exactly as before; General Door Code Printing is
-  // an extra action after it that never blocks, delays or fails it.
+  // The scan is submitted exactly as before; Temporary Data Matrix Printing
+  // is an extra action after it that never blocks, delays or fails it.
   runScanActions({
     postScan: () => postScanToApi(tabId, id, {
       apiUrl: conn.apiUrl,
@@ -381,9 +407,9 @@ function sendScan(tabId, portPath, value) {
       device: portPath,
       source: 'com_listener'
     }, value),
-    trigger: generalDoorTrigger,
+    triggers: [tempLabelTrigger],
     scan: { value, stationKey: conn.stationKey, portPath, apiUrl: conn.apiUrl },
-    onTriggerError: (err) => comLogger.error(`General door label trigger error on ${portPath}: ${err && err.message}`)
+    onTriggerError: (err) => comLogger.error(`Scan print trigger error on ${portPath}: ${err && err.message}`)
   });
 }
 
@@ -531,42 +557,6 @@ async function recoverPendingJobs(tabId) {
   }
 }
 
-// The General Door Code Printing counterpart of recoverPendingJobs above:
-// that station's own unfinished jobs (recorded under jobStationKey(), so
-// recoverPendingJobs never sees them) go back to the same printProcessor,
-// addressed to the station's CURRENT printer. A job that has no local
-// attempt record would really print, so it is only enqueued while the
-// station is still enabled and its printer is available - otherwise it is
-// left pending on the website and logged, never sent to another printer.
-async function recoverPendingGeneralDoorJobs(tabId) {
-  const conn = connections.get(tabId);
-  if (!conn || !conn.apiUrl || !conn.stationKey) return;
-  const apiBase = deriveApiBase(conn.apiUrl);
-  if (!apiBase) return;
-
-  const result = await fetchPendingJobs(apiBase, jobStationKey(conn.stationKey));
-  if (!result.ok || result.jobs.length === 0) return;
-
-  const station = STATION_NAMES.get(conn.stationKey) || conn.stationKey;
-  const rule = doorPrintSettings.ruleForStation(loadDoorPrintSettings(), conn.stationKey);
-  const usable = rule && rule.enabled && rule.printerName ? await checkStationPrinter(rule.printerName) : { ok: false, reason: 'General door printing is not enabled for this station' };
-
-  for (const job of result.jobs) {
-    if (printAttemptStore.get(job.jobId)) {
-      // Already attempted/submitted before a restart: the processor only
-      // confirms or fails it, it never prints it again.
-      printProcessor.enqueue(job, apiBase, rule && rule.printerName ? { printerName: rule.printerName } : {});
-      continue;
-    }
-    if (!usable.ok) {
-      comLogger.warn(`General door label job ${job.jobId} (order ${job.baseOrder || '?'}, station ${station}) left pending: ${usable.reason}`);
-      continue;
-    }
-    comLogger.info(`General door label job ${job.jobId} (order ${job.baseOrder || '?'}, station ${station}) recovered after reconnect - printing on ${rule.printerName}.`);
-    printProcessor.enqueue(job, apiBase, { printerName: rule.printerName });
-  }
-}
-
 function closeConnection(tabId) {
   const conn = connections.get(tabId);
   if (!conn) return;
@@ -662,7 +652,10 @@ ipcMain.handle('manual-scan', async (event, { tabId, code, stationKey, apiUrl } 
 ipcMain.handle('load-settings', async () => loadSettingsFromDisk());
 
 ipcMain.handle('save-settings', async (event, settings) => {
+  const previousApiUrl = loadSettingsFromDisk().apiUrl;
   const saved = saveSettingsToDisk(settings || {});
+  // A new Server API URL is also where temporary-label data comes from.
+  if (saved && saved.apiUrl && saved.apiUrl !== previousApiUrl) tempLabelSource.refresh('API URL changed').catch(() => {});
   return { ok: true, settings: saved };
 });
 
@@ -731,11 +724,22 @@ ipcMain.handle('test-reprint-job', async (event, { jobId }) => {
   return { ok: true };
 });
 
-// ---- General Door Code Printing settings (this PC only - no Remote Admin route) ----
+// ---- Temporary Data Matrix Printing (this PC only - no Remote Admin route) ----
 
-ipcMain.handle('get-door-print-settings', async () => loadDoorPrintSettings());
+function describeTempLabelStations(stations) {
+  return stations
+    .map((row) => `${STATION_NAMES.get(row.stationKey) || row.stationKey}: ${row.enabled ? `enabled, printer ${row.printerName}` : 'disabled'}`)
+    .join('; ') || 'no stations';
+}
 
-ipcMain.handle('save-door-print-settings', async (event, raw) => {
+ipcMain.handle('get-temp-label-settings', async () => ({
+  settings: loadTempLabelSettings(),
+  defaults: tempLabelSettings.DEFAULT_LAYOUT,
+  maxPerScan: MAX_TEMP_LABELS_PER_SCAN,
+  status: tempLabelSource.status()
+}));
+
+ipcMain.handle('save-temp-label-stations', async (event, stations) => {
   let installedPrinters;
   try {
     const listed = await windowsPrinter.listPrinters();
@@ -745,16 +749,56 @@ ipcMain.handle('save-door-print-settings', async (event, raw) => {
   }
   let result;
   try {
-    result = doorPrintSettings.saveDoorPrintSettings(DOOR_PRINT_SETTINGS_PATH(), raw || {}, { installedPrinters });
+    result = tempLabelSettings.saveTempLabelSettings(TEMP_LABEL_SETTINGS_PATH(), { stations, layout: loadTempLabelSettings().layout }, { installedPrinters });
   } catch (err) {
     return { ok: false, errors: [`Could not save: ${err.message}`] };
   }
   if (!result.ok) return result;
-  const summary = result.settings.stations
-    .map((row) => `${STATION_NAMES.get(row.stationKey) || row.stationKey}: ${row.enabled ? `enabled, printer ${row.printerName}` : 'disabled'}`)
-    .join('; ');
-  comLogger.info(`General Door Code Printing settings saved on this PC - ${summary || 'no stations'}.`);
+  comLogger.info(`Temporary Data Matrix Printing stations saved on this PC - ${describeTempLabelStations(result.settings.stations)}.`);
   return { ok: true, settings: result.settings };
+});
+
+ipcMain.handle('save-temp-label-layout', async (event, layout) => {
+  let result;
+  try {
+    result = tempLabelSettings.saveTempLabelSettings(TEMP_LABEL_SETTINGS_PATH(), { stations: loadTempLabelSettings().stations, layout });
+  } catch (err) {
+    return { ok: false, errors: [`Could not save: ${err.message}`] };
+  }
+  if (!result.ok) return result;
+  const l = result.settings.layout;
+  comLogger.info(`Temporary label layout saved on this PC - ${l.widthMm}x${l.heightMm}mm, ${l.dpi}dpi, module ${l.moduleDots} dots, offset ${l.shiftXMm}/${l.shiftYMm}mm.`);
+  return { ok: true, settings: result.settings };
+});
+
+ipcMain.handle('get-temp-label-status', async () => tempLabelSource.status());
+
+ipcMain.handle('get-temp-label-key-status', async () => tempLabelAccessKey.status());
+
+// Replaces this PC's website access key. The new key's SHA-256 must then be
+// put in the website's TEMP_LABELS_KEY_SHA256 before refreshes work again
+// (the local cache keeps printing meanwhile).
+ipcMain.handle('generate-temp-label-key', async () => {
+  let result;
+  try {
+    result = tempLabelAccessKey.generate();
+  } catch (err) {
+    return { ok: false, error: `Could not save the key: ${err.message}` };
+  }
+  if (!result.ok) return result;
+  comLogger.info(`Temporary-label website access key generated on this PC (SHA-256 starts ${result.sha256.slice(0, 12)}).`);
+  return { ok: true, status: tempLabelAccessKey.status() };
+});
+
+ipcMain.handle('refresh-temp-label-data', async () => tempLabelSource.refresh('manual'));
+
+// ONE label, on the chosen station's configured printer, with the typed code.
+// Works for a disabled station too, so a printer can be set up and aligned
+// before scans are switched on.
+ipcMain.handle('print-temp-test-label', async (event, { stationKey, code } = {}) => {
+  const rule = tempLabelSettings.ruleForStation(loadTempLabelSettings(), String(stationKey || ''));
+  if (!rule || !rule.printerName) return { ok: false, error: 'Save a printer for this station first.' };
+  return tempLabelTrigger.printTestLabel({ printerName: rule.printerName, code, stationKey: rule.stationKey });
 });
 
 // Opens one tab's COM port - the one implementation behind both the Windows
@@ -807,7 +851,6 @@ function openConnection({ tabId, path: portPath, baudRate, stationKey, apiUrl, s
       // is what decides which stations ever have print jobs (only
       // Pre-Hung does today), so this never needs to hard-code that here.
       recoverPendingJobs(tabId);
-      recoverPendingGeneralDoorJobs(tabId).catch((err) => comLogger.warn(`General door job recovery on ${portPath} failed: ${err.message}`));
     });
 
     port.on('data', (chunk) => handleIncomingData(tabId, portPath, chunk));
@@ -1183,7 +1226,7 @@ const updates = createUpdateController({
   installSupport: updateInstallSupport,
   activity: () => ({
     connectedScanners: Array.from(connections.values()).filter((conn) => conn.port && conn.port.isOpen).length,
-    printJobsActive: printProcessor.queue.length + (printProcessor.processing ? 1 : 0)
+    printJobsActive: printProcessor.queue.length + (printProcessor.processing ? 1 : 0) + tempLabelTrigger.queue.pending
   }),
   logger: updaterLogger,
   onState: (state) => {

@@ -14,11 +14,6 @@ contextBridge.exposeInMainWorld('comBridge', {
   getPrinterStatus: (printerName) => ipcRenderer.invoke('get-printer-status', printerName),
   printTestPattern: (dims) => ipcRenderer.invoke('print-test-pattern', dims),
   reprintTestJob: (jobId) => ipcRenderer.invoke('test-reprint-job', { jobId }),
-  getDoorPrintSettings: () => ipcRenderer.invoke('get-door-print-settings'),
-  saveDoorPrintSettings: (settings) => ipcRenderer.invoke('save-door-print-settings', settings),
-  onGeneralDoorPrintEvent: (callback) => {
-    ipcRenderer.on('general-door-print-event', (event, data) => callback(data));
-  },
 
   onStatus: (callback) => {
     ipcRenderer.on('port-status', (event, data) => callback(data));
@@ -35,6 +30,26 @@ contextBridge.exposeInMainWorld('comBridge', {
   // A connection was changed from Remote Admin - the full, saved settings.
   onSettingsChanged: (callback) => {
     ipcRenderer.on('com-settings-changed', (event, settings) => callback(settings));
+  }
+});
+
+// Temporary Data Matrix Printing (see main.js's section of the same name).
+// Local window only - there is no Remote Admin equivalent.
+contextBridge.exposeInMainWorld('tempLabels', {
+  getSettings: () => ipcRenderer.invoke('get-temp-label-settings'),
+  saveStations: (stations) => ipcRenderer.invoke('save-temp-label-stations', stations),
+  saveLayout: (layout) => ipcRenderer.invoke('save-temp-label-layout', layout),
+  getStatus: () => ipcRenderer.invoke('get-temp-label-status'),
+  getKeyStatus: () => ipcRenderer.invoke('get-temp-label-key-status'),
+  generateKey: () => ipcRenderer.invoke('generate-temp-label-key'),
+  refresh: () => ipcRenderer.invoke('refresh-temp-label-data'),
+  printTest: (stationKey, code) => ipcRenderer.invoke('print-temp-test-label', { stationKey, code }),
+
+  onSourceStatus: (callback) => {
+    ipcRenderer.on('temp-label-source-status', (event, status) => callback(status));
+  },
+  onEvent: (callback) => {
+    ipcRenderer.on('temp-label-event', (event, outcome) => callback(outcome));
   }
 });
 

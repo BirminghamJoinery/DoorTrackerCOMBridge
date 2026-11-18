@@ -108,30 +108,55 @@ drive the real iPad page in headless Google Chrome
 (`src/delivery-photos/offline-browser.test.js`), skipping cleanly if Chrome is
 not installed.
 
-## General Door Code Printing
+## Temporary Data Matrix Printing
 
-A station can print an order's labels when its scanner scans the order's
-general door code: `5698-D` or `5626-2-D` (four digits, an optional
-call-off, then exactly `-D`). Individual door codes (`5698-D-01`), frame
-codes (`-F`) and delivery codes (`-DELIV`) never trigger it. The scan is
-still sent to the website exactly as before; printing is an extra action.
+When a scanner at an enabled station scans an order's general door code -
+`5698-D` or `5626-2-D` (four digits, an optional 1-3 digit call-off, then
+exactly `-D`) - the station's own USB printer prints that order's
+**temporary labels**: one centred Data Matrix per label, encoding exactly
+`5698-T-01`, `5698-T-02`, ... (`5626-2-T-01`, ... for a call-off) and nothing
+else. Numbers are two digits up to 99, then `100`, `101`, ... Individual door
+codes (`5698-D-01`), frame (`-F`), delivery (`-DELIV`) and temporary (`-T-01`)
+codes never trigger it. The scan is still sent to the website exactly as
+before; printing is an extra action that never blocks or fails it.
 
-Set it up in the **Printing** area under **General Door Code Printing**:
-choose a station, a printer, tick **Enable general door label printing**,
-then **Save Station**. Each station has its own printer. The rule belongs to
-the station, not the COM port, so moving a scanner to another port keeps it.
-Settings live in `door-print-settings.json` in the app's user-data folder
-(`%APPDATA%\Door Tracker COM Bridge\`), so updates keep them. Remote Admin
-cannot change them.
+**Quantity source:** a Google Sheet with the header row
+`Order Number | Temp Label Qty` (columns A and B), read by the website with its
+existing service account through `GET /api/temp-labels`. This app fetches it
+from the Server API URL's site at start-up, every 5 minutes and on **Refresh
+Label Data**, and keeps a local copy (`temp-labels-cache.json` in the
+user-data folder) that scans read - so printing keeps working with the
+internet down, and after a restart. A failed refresh keeps the last good copy.
+If the copy is more than 24 hours old the app warns
+("Cached label data is over 24 hours old") but keeps printing from it.
+Quantities must be whole numbers 1-200; blank, text, zero, negative or larger
+values are refused and logged, and an order listed twice with different
+quantities is refused until the sheet is fixed.
 
-On a matching scan the bridge checks the station's printer is installed and
-online, asks the website for the order's normal label job
-(`POST /api/print-jobs/order`), and hands it to the same print-job processor
-as every other job, addressed to that printer only. If the printer is missing
-or offline nothing is printed anywhere else; the failure is logged and shown
-in the table. The same order at the same station is ignored for 45 seconds
-after a successful trigger, so an accidental double scan prints once.
-Scanning again after that prints again.
+**Website access key:** `/api/temp-labels` only answers a request carrying
+`Authorization: Bearer <key>` - the same scheme as the Photo Bridge endpoints.
+Press **Generate Access Key** in the app: it makes a random key, stores it
+encrypted for this Windows user (DPAPI) in `temp-labels-access-key.json`, and
+shows only the key's SHA-256. Put that SHA-256 in the website's
+`TEMP_LABELS_KEY_SHA256` setting (several, comma-separated, if more than one
+PC). The key itself is never shown, logged or sent anywhere else. Without a
+matching setting the website refuses the request (401), or refuses everyone
+if `TEMP_LABELS_KEY_SHA256` is not set (503).
+
+**Printing:** the station's printer is named exactly - there is no fallback
+to the main printer or the Windows default - and checked just before sending;
+a missing or offline printer (as Windows reports it) refuses the batch. Each
+scan's labels go to the printer as one raw ZPL job (native `^BX` Data Matrix)
+named **Temporary Labels - <order>** in the Windows print queue, one batch at
+a time. The same order at the same station on the same printer is ignored for
+45 seconds after a successful batch; a failed batch can be rescanned at once.
+
+Set it up under **Printing > Temporary Data Matrix Printing**: station,
+**Enable temporary label printing**, printer, **Save Station**. The label
+layout (size, module size, X/Y offset) starts from the GK420D's existing
+89x36mm setup and can be adjusted; **Test Temporary Label** prints one label
+with a typed code on a saved station's printer. Remote Admin cannot change any
+of this.
 
 ## Remote Admin (COM connections from another PC)
 

@@ -99,12 +99,19 @@ $printer = Get-CimInstance -ClassName Win32_Printer -Filter "Name='$escaped'"
 if ($null -eq $printer) {
   @{ found = $false } | ConvertTo-Json -Compress
 } else {
-  @{ found = $true; isOffline = [bool]$printer.WorkOffline } | ConvertTo-Json -Compress
+  @{ found = $true; isOffline = [bool]$printer.WorkOffline; printerStatus = [int]$printer.PrinterStatus; extendedStatus = [int]$printer.ExtendedPrinterStatus } | ConvertTo-Json -Compress
 }
 `;
 
 // Returns { supported: false, found: false, offline: false } off-Windows.
-// On Windows, { supported: true, found, offline }.
+// On Windows, { supported: true, found, offline, statusOffline }.
+//
+// `offline` is the "Use Printer Offline" flag (WorkOffline), exactly as
+// before - existing printing checks only that. `statusOffline` is additional:
+// Windows' own PrinterStatus/ExtendedPrinterStatus reporting 7 (Offline),
+// which is what Windows usually shows for an unplugged or switched-off USB
+// printer even when WorkOffline is false. Only Temporary Data Matrix
+// Printing refuses to print on it (see main.js's checkTempLabelPrinter).
 async function getPrinterStatus(printerName) {
   if (!IS_WINDOWS) {
     return { supported: false, found: false, offline: false };
@@ -115,7 +122,8 @@ async function getPrinterStatus(printerName) {
 
   const stdout = await runPowerShellScript(GET_STATUS_SCRIPT, ['-PrinterName', printerName]);
   const parsed = stdout ? JSON.parse(stdout) : { found: false };
-  return { supported: true, found: !!parsed.found, offline: !!parsed.isOffline };
+  const statusOffline = parsed.printerStatus === 7 || parsed.extendedStatus === 7;
+  return { supported: true, found: !!parsed.found, offline: !!parsed.isOffline, statusOffline };
 }
 
 // Canonical Win32 "send raw bytes to a printer queue" pattern (OpenPrinter/
@@ -127,7 +135,8 @@ async function getPrinterStatus(printerName) {
 const SEND_RAW_SCRIPT = `
 param(
   [Parameter(Mandatory=$true)][string]$PrinterName,
-  [Parameter(Mandatory=$true)][string]$FilePath
+  [Parameter(Mandatory=$true)][string]$FilePath,
+  [string]$DocName = 'Door Tracker Delivery Label'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -166,11 +175,11 @@ public class RawPrinterHelper
     [DllImport("winspool.drv", EntryPoint = "WritePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
     public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, Int32 dwCount, out Int32 dwWritten);
 
-    public static void SendBytesToPrinter(string printerName, byte[] bytes)
+    public static void SendBytesToPrinter(string printerName, byte[] bytes, string docName)
     {
         IntPtr hPrinter;
         DOCINFOA di = new DOCINFOA();
-        di.pDocName = "Door Tracker Delivery Label";
+        di.pDocName = docName;
         di.pDataType = "RAW";
         bool ok;
 
@@ -221,16 +230,30 @@ public class RawPrinterHelper
 '@
 
 $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-[RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes)
+[RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes, $DocName)
 Write-Output "OK"
 `;
 
+// The name Windows shows for a job in the printer queue. Every existing
+// caller (delivery/main-printer jobs, the test pattern) passes nothing and
+// keeps exactly this name; Temporary Data Matrix Printing passes its own.
+const DEFAULT_DOC_NAME = 'Door Tracker Delivery Label';
+
+// A document name is shown, never interpreted: keep it short, printable
+// ASCII (DOCINFOA is ANSI), and fall back to the default if nothing is left.
+function cleanDocName(docName) {
+  if (typeof docName !== 'string') return DEFAULT_DOC_NAME;
+  const cleaned = docName.replace(/[^\x20-\x7e]/g, '').trim().slice(0, 100);
+  return cleaned || DEFAULT_DOC_NAME;
+}
+
 // Submits raw bytes (already-generated ZPL text, encoded as a Buffer) to a
 // named Windows printer queue, bypassing the driver's own rendering.
+// options.docName (optional) is the job name shown in the Windows queue.
 // Resolves once Windows has accepted the submission (WritePrinter
 // succeeded) — see printer-service.js for exactly what that does and does
 // not prove about physical output.
-async function sendRawData(printerName, dataBuffer) {
+async function sendRawData(printerName, dataBuffer, options = {}) {
   if (!IS_WINDOWS) {
     throw new Error('Raw printer submission is only implemented on Windows.');
   }
@@ -239,10 +262,10 @@ async function sendRawData(printerName, dataBuffer) {
   fs.writeFileSync(tempDataPath, dataBuffer);
 
   try {
-    await runPowerShellScript(SEND_RAW_SCRIPT, ['-PrinterName', printerName, '-FilePath', tempDataPath]);
+    await runPowerShellScript(SEND_RAW_SCRIPT, ['-PrinterName', printerName, '-FilePath', tempDataPath, '-DocName', cleanDocName(options && options.docName)]);
   } finally {
     fs.unlink(tempDataPath, () => {});
   }
 }
 
-module.exports = { listPrinters, getPrinterStatus, sendRawData };
+module.exports = { listPrinters, getPrinterStatus, sendRawData, cleanDocName, DEFAULT_DOC_NAME };

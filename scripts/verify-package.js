@@ -9,8 +9,10 @@
 //   - latest.yml naming that installer, with a SHA-512 that really matches it
 //     (what electron-updater verifies every download against);
 //   - app-update.yml inside the app;
-//   - the updater, Remote Admin (including its web page) and shared COM code
-//     inside app.asar, and electron-updater itself.
+//   - the updater, Remote Admin (including its web page), Temporary Data
+//     Matrix Printing, Delivery Photos (worker code inside app.asar, the iPad
+//     web page in app.asar or app.asar.unpacked) and shared COM code, and
+//     electron-updater itself.
 // Exits non-zero, listing every problem, if anything is missing or wrong.
 //
 //   node scripts/verify-package.js [distDir]
@@ -75,10 +77,35 @@ if (check(fs.existsSync(asarPath), 'Missing win-unpacked/resources/app.asar')) {
     '/src/remote-admin/web/index.html',
     '/src/remote-admin/web/admin.js',
     '/src/remote-admin/web/admin.css',
+    '/src/scan-actions.js',
+    '/src/retired-files.js',
+    '/src/delivery-photos/worker-entry.js',
+    '/src/delivery-photos/worker.js',
+    '/src/delivery-photos/http-server.js',
+    '/src/delivery-photos/web-shell.js',
+    '/src/temp-labels/access-key.js',
+    '/src/temp-labels/codes.js',
+    '/src/temp-labels/settings.js',
+    '/src/temp-labels/source-cache.js',
+    '/src/temp-labels/trigger.js',
+    '/src/temp-labels/zpl.js',
     '/node_modules/electron-updater/package.json',
     '/node_modules/electron-updater/out/main.js'
   ];
   for (const file of required) check(files.has(file), `Missing from app.asar: ${file}`);
+
+  // The Delivery Photos iPad page is asarUnpack'ed (package.json), so it may
+  // be listed in app.asar, extracted to app.asar.unpacked, or both - any of
+  // those is reachable at run time; missing from both is not.
+  const unpacked = nodePath.join(resources, 'app.asar.unpacked');
+  const deliveryPhotosWeb = [
+    'index.html', 'app.js', 'camera.js', 'offline-queue.js', 'scanner.js', 'style.css', 'sw.js',
+    'manifest.webmanifest', 'vendor/zxing/zxing-reader.js', 'vendor/zxing/zxing_reader.wasm'
+  ];
+  for (const name of deliveryPhotosWeb) {
+    const rel = `/delivery-photos-web/${name}`;
+    check(files.has(rel) || fs.existsSync(nodePath.join(unpacked, 'delivery-photos-web', ...name.split('/'))), `Missing Delivery Photos web asset: ${rel}`);
+  }
   check(![...files].some((f) => f.endsWith('.test.js')), 'app.asar contains test files');
 }
 
@@ -87,4 +114,4 @@ if (problems.length > 0) {
   for (const problem of problems) console.error(`  - ${problem}`);
   process.exit(1);
 }
-console.log(`Package verification passed for version ${version}: release assets, update metadata (SHA-512 matches), app-update.yml, updater and Remote Admin files are all present.`);
+console.log(`Package verification passed for version ${version}: release assets, update metadata (SHA-512 matches), app-update.yml, updater, Remote Admin, Temporary Data Matrix Printing and Delivery Photos files are all present.`);

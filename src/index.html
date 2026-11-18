@@ -52,32 +52,108 @@
     </div>
     <span id="printer-test-result" class="status-message"></span>
 
-    <div class="door-print-section">
-      <h3>General Door Code Printing</h3>
-      <p class="hint">When a scanner on an enabled station scans an order's general door code (e.g. 5698-D or 5626-2-D), that order's labels print on the station's own printer. Set per station, not per COM port. The scan is still sent as normal; individual door (5698-D-01), frame and delivery codes never print.</p>
-      <div class="door-print-editor">
+    <div class="print-rule-section temp-label-section">
+      <h3>Temporary Data Matrix Printing</h3>
+      <p class="hint">When a scanner on an enabled station scans an order's general door code (e.g. 5698-D or 5626-2-D), temporary labels 5698-T-01, 5698-T-02, ... print on the station's own printer - one centred Data Matrix per label. The quantity comes from the Temp Label Qty column of the Google Sheet (kept in a local copy on this PC). Set per station, not per COM port. The scan is still sent as normal; individual door (5698-D-01), frame, delivery and temporary (5698-T-01) codes never print.</p>
+
+      <div class="status-bar temp-label-source">
+        <span>Source:</span>
+        <span id="temp-label-source-badge" class="badge disconnected">-</span>
+        <span id="temp-label-source-detail" class="status-message"></span>
+        <button id="temp-label-refresh-btn">Refresh Label Data</button>
+      </div>
+      <p id="temp-label-source-error" class="dp-save-error" hidden></p>
+
+      <div class="status-bar temp-label-key">
+        <span>Website access key:</span>
+        <span id="temp-key-badge" class="badge disconnected">Not set</span>
+        <span id="temp-key-detail" class="status-message"></span>
+        <button id="temp-key-generate-btn">Generate Access Key</button>
+      </div>
+      <div id="temp-key-hash-row" class="temp-key-hash-row" hidden>
+        <label for="temp-key-hash">Put this in the website's <code>TEMP_LABELS_KEY_SHA256</code> setting (it is the key's SHA-256, not the key):</label>
+        <input id="temp-key-hash" type="text" readonly />
+        <button id="temp-key-copy-btn">Copy</button>
+      </div>
+
+      <div class="print-rule-editor">
         <div class="field">
-          <label for="door-print-station">Station</label>
-          <select id="door-print-station"></select>
+          <label for="temp-label-station">Station</label>
+          <select id="temp-label-station"></select>
+        </div>
+        <div class="field print-rule-enable">
+          <label><input type="checkbox" id="temp-label-enabled" /> Enable temporary label printing</label>
         </div>
         <div class="field">
-          <label for="door-print-printer">Printer</label>
-          <select id="door-print-printer"></select>
+          <label for="temp-label-printer">Printer</label>
+          <select id="temp-label-printer"></select>
         </div>
-        <div class="field door-print-enable">
-          <label><input type="checkbox" id="door-print-enabled" /> Enable general door label printing</label>
+        <div class="field">
+          <label>Source</label>
+          <span class="temp-label-source-name">Google Sheet (via the Server API URL)</span>
         </div>
         <div class="field buttons">
-          <button id="door-print-save-btn">Save Station</button>
-          <button id="door-print-remove-btn">Remove</button>
+          <button id="temp-label-save-btn">Save Station</button>
+          <button id="temp-label-remove-btn">Remove</button>
         </div>
-        <span id="door-print-saved" class="saved-flash"></span>
+        <span id="temp-label-saved" class="saved-flash"></span>
       </div>
-      <p id="door-print-error" class="dp-save-error" hidden></p>
-      <table class="dp-devices door-print-table">
-        <thead><tr><th>Station</th><th>Status</th><th>Printer</th><th>Last trigger</th></tr></thead>
-        <tbody id="door-print-body"></tbody>
+      <p id="temp-label-error" class="dp-save-error" hidden></p>
+      <table class="dp-devices print-rule-table">
+        <thead><tr><th>Station</th><th>Status</th><th>Printer</th><th>Last print</th></tr></thead>
+        <tbody id="temp-label-body"></tbody>
       </table>
+
+      <h4>Temporary label layout</h4>
+      <p class="hint">Starting values are the GK420D's existing 89&times;36mm setup. Adjust after the first physical test print. At 203dpi, 8 dots = 1mm per Data Matrix module.</p>
+      <div class="print-rule-editor">
+        <div class="field">
+          <label for="temp-layout-width">Width (mm)</label>
+          <input id="temp-layout-width" type="number" min="10" max="120" step="0.5" style="width: 70px" />
+        </div>
+        <div class="field">
+          <label for="temp-layout-height">Height (mm)</label>
+          <input id="temp-layout-height" type="number" min="5" max="300" step="0.5" style="width: 70px" />
+        </div>
+        <div class="field">
+          <label for="temp-layout-dpi">Resolution</label>
+          <select id="temp-layout-dpi"><option value="203">203 dpi</option><option value="300">300 dpi</option></select>
+        </div>
+        <div class="field">
+          <label for="temp-layout-module">Module (dots)</label>
+          <input id="temp-layout-module" type="number" min="3" max="20" step="1" style="width: 60px" />
+        </div>
+        <div class="field">
+          <label for="temp-layout-shift-x">Offset X (mm, minus = left)</label>
+          <input id="temp-layout-shift-x" type="number" min="-10" max="10" step="0.5" style="width: 70px" />
+        </div>
+        <div class="field">
+          <label for="temp-layout-shift-y">Offset Y (mm, plus = down)</label>
+          <input id="temp-layout-shift-y" type="number" min="-10" max="10" step="0.5" style="width: 70px" />
+        </div>
+        <div class="field buttons">
+          <button id="temp-layout-save-btn">Save Layout</button>
+          <button id="temp-layout-defaults-btn">Defaults</button>
+        </div>
+        <span id="temp-layout-saved" class="saved-flash"></span>
+      </div>
+      <p id="temp-layout-error" class="dp-save-error" hidden></p>
+
+      <h4>Test Temporary Label</h4>
+      <div class="print-rule-editor">
+        <div class="field">
+          <label for="temp-test-station">Station / printer</label>
+          <select id="temp-test-station"></select>
+        </div>
+        <div class="field">
+          <label for="temp-test-code">Test code</label>
+          <input id="temp-test-code" type="text" value="TEST-T-01" maxlength="40" style="width: 140px" />
+        </div>
+        <div class="field buttons">
+          <button id="temp-test-print-btn">Test Temporary Label</button>
+        </div>
+      </div>
+      <span id="temp-test-result" class="status-message"></span>
     </div>
   </section>
 

@@ -105,10 +105,7 @@ function buildJobZpl(job) {
 async function printJob(job) {
   validateJob(job);
 
-  // A job addressed to a specific printer (General Door Code Printing - see
-  // print-job-processor.js's enqueue) goes to that printer or fails; it never
-  // falls back to the main configured printer or the Windows default.
-  const printerName = job.printerName ? String(job.printerName) : await validatePrinterConfigured();
+  const printerName = await validatePrinterConfigured();
   await validatePrinterExists(printerName);
 
   const zpl = buildJobZpl(job);

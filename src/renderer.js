@@ -810,39 +810,142 @@ reprintTestBtn.addEventListener('click', async () => {
     : `Failed: ${result.error}`;
 });
 
-// ---- General Door Code Printing ----
-// Per-STATION rule (enabled + printer) for printing an order's labels when
-// that station scans its general door code - see general-door-trigger.js and
-// door-print-settings.js. Saved and validated in the main process; this is
-// only the editor and the status table.
-
-const doorPrintStationSelect = document.getElementById('door-print-station');
-const doorPrintPrinterSelect = document.getElementById('door-print-printer');
-const doorPrintEnabledInput = document.getElementById('door-print-enabled');
-const doorPrintSaveBtn = document.getElementById('door-print-save-btn');
-const doorPrintRemoveBtn = document.getElementById('door-print-remove-btn');
-const doorPrintSavedFlash = document.getElementById('door-print-saved');
-const doorPrintError = document.getElementById('door-print-error');
-const doorPrintBody = document.getElementById('door-print-body');
-
-let doorPrintSettings = { stations: [] };
 let installedPrinterNames = null; // null = cannot list printers on this platform
-const doorPrintLastOutcome = new Map(); // stationKey -> latest trigger outcome
 
-function doorPrintRule(stationKey) {
-  return doorPrintSettings.stations.find((row) => row.stationKey === stationKey) || null;
+// ---- Temporary Data Matrix Printing ----
+// Per-STATION rule (enabled + printer), the label layout, the source cache
+// status and a one-label test print - see temp-labels/ and main.js's section
+// of the same name. Saved and validated in the main process; this is only
+// the editor and the status display.
+
+const tl = {
+  sourceBadge: document.getElementById('temp-label-source-badge'),
+  sourceDetail: document.getElementById('temp-label-source-detail'),
+  sourceError: document.getElementById('temp-label-source-error'),
+  refreshBtn: document.getElementById('temp-label-refresh-btn'),
+  station: document.getElementById('temp-label-station'),
+  enabled: document.getElementById('temp-label-enabled'),
+  printer: document.getElementById('temp-label-printer'),
+  saveBtn: document.getElementById('temp-label-save-btn'),
+  removeBtn: document.getElementById('temp-label-remove-btn'),
+  saved: document.getElementById('temp-label-saved'),
+  error: document.getElementById('temp-label-error'),
+  body: document.getElementById('temp-label-body'),
+  layoutInputs: {
+    widthMm: document.getElementById('temp-layout-width'),
+    heightMm: document.getElementById('temp-layout-height'),
+    dpi: document.getElementById('temp-layout-dpi'),
+    moduleDots: document.getElementById('temp-layout-module'),
+    shiftXMm: document.getElementById('temp-layout-shift-x'),
+    shiftYMm: document.getElementById('temp-layout-shift-y')
+  },
+  layoutSaveBtn: document.getElementById('temp-layout-save-btn'),
+  layoutDefaultsBtn: document.getElementById('temp-layout-defaults-btn'),
+  layoutSaved: document.getElementById('temp-layout-saved'),
+  layoutError: document.getElementById('temp-layout-error'),
+  testStation: document.getElementById('temp-test-station'),
+  testCode: document.getElementById('temp-test-code'),
+  testBtn: document.getElementById('temp-test-print-btn'),
+  testResult: document.getElementById('temp-test-result')
+};
+
+const tk = {
+  badge: document.getElementById('temp-key-badge'),
+  detail: document.getElementById('temp-key-detail'),
+  generateBtn: document.getElementById('temp-key-generate-btn'),
+  hashRow: document.getElementById('temp-key-hash-row'),
+  hash: document.getElementById('temp-key-hash'),
+  copyBtn: document.getElementById('temp-key-copy-btn')
+};
+
+// Only the key's SHA-256 ever reaches this page - never the key itself.
+function renderTempKeyStatus(status) {
+  const set = status && status.set;
+  const usable = set && status.usable;
+  tk.badge.className = `badge ${usable ? 'connected' : set ? 'error' : 'disconnected'}`;
+  tk.badge.textContent = usable ? 'Set' : set ? 'Unreadable' : 'Not set';
+  tk.detail.textContent = usable
+    ? `Created ${formatRefreshTime(status.createdAt)}`
+    : set ? status.problem : 'Label data cannot be refreshed until a key is generated and its SHA-256 is set on the website.';
+  tk.generateBtn.textContent = set ? 'Replace Access Key' : 'Generate Access Key';
+  tk.hashRow.hidden = !usable;
+  tk.hash.value = usable ? status.sha256 : '';
 }
 
-function describeDoorPrintOutcome(outcome) {
+tk.generateBtn.addEventListener('click', async () => {
+  const current = await window.tempLabels.getKeyStatus();
+  if (current && current.set && !window.confirm('Replace the website access key? Label data will not refresh until the website\'s TEMP_LABELS_KEY_SHA256 is updated with the new value. The cached data keeps printing meanwhile.')) return;
+  const result = await window.tempLabels.generateKey();
+  if (!result.ok) {
+    tk.detail.textContent = `Failed: ${result.error}`;
+    return;
+  }
+  renderTempKeyStatus(result.status);
+});
+
+tk.copyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(tk.hash.value);
+    tk.copyBtn.textContent = 'Copied';
+  } catch {
+    tk.hash.select();
+    tk.copyBtn.textContent = 'Press Ctrl+C';
+  }
+  setTimeout(() => { tk.copyBtn.textContent = 'Copy'; }, 1500);
+});
+
+let tempLabelSettings = { stations: [], layout: {} };
+let tempLabelDefaults = null;
+const tempLabelLastOutcome = new Map(); // stationKey -> latest batch outcome
+
+function tempLabelRule(stationKey) {
+  return tempLabelSettings.stations.find((row) => row.stationKey === stationKey) || null;
+}
+
+function formatRefreshTime(iso) {
+  if (!iso) return 'never';
+  const at = new Date(iso);
+  const sameDay = at.toDateString() === new Date().toDateString();
+  const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return sameDay ? time : `${at.toLocaleDateString()} ${time}`;
+}
+
+const TEMP_SOURCE_BADGES = {
+  connected: ['connected', 'Connected'],
+  cached: ['disconnected', 'Cached'],
+  error: ['error', 'Error'],
+  empty: ['disconnected', 'Not loaded yet']
+};
+
+function renderTempLabelSource(status) {
+  if (!status) return;
+  const [cls, text] = TEMP_SOURCE_BADGES[status.state] || ['disconnected', status.state];
+  tl.sourceBadge.className = `badge ${cls}`;
+  tl.sourceBadge.textContent = status.refreshing ? `${text} (refreshing...)` : text;
+  const parts = [`Last successful refresh: ${formatRefreshTime(status.lastSuccessAt)}`, `Orders cached: ${status.ordersCached}`];
+  if (status.invalidOrders) parts.push(`Invalid rows: ${status.invalidOrders} (see log)`);
+  if (status.sheetName) parts.push(`Tab: ${status.sheetName}`);
+  tl.sourceDetail.textContent = parts.join(' | ');
+  tl.refreshBtn.disabled = Boolean(status.refreshing);
+  const messages = [];
+  if (status.stale) messages.push('Cached label data is over 24 hours old - check the website connection and access key. Printing still uses it.');
+  if (status.lastError && status.state !== 'connected') {
+    messages.push(`Last refresh failed at ${formatRefreshTime(status.lastErrorAt)}: ${status.lastError}${status.state === 'cached' ? ' - using the cached data.' : ''}`);
+  }
+  tl.sourceError.hidden = messages.length === 0;
+  tl.sourceError.textContent = messages.join(' ');
+}
+
+function describeTempLabelOutcome(outcome) {
   const time = new Date(outcome.at).toLocaleTimeString();
-  if (outcome.result === 'created') return `${time} ${outcome.order} (${outcome.portPath}) - print job created ${outcome.jobId}`;
+  if (outcome.result === 'submitted') return `${time} ${outcome.order} - ${outcome.quantity} label(s) submitted (${outcome.firstCode}${outcome.quantity > 1 ? ` to ${outcome.lastCode}` : ''})`;
   if (outcome.result === 'suppressed') return `${time} ${outcome.order} - duplicate scan ignored`;
-  return `${time} ${outcome.order} - FAILED: ${outcome.reason}`;
+  return `${time} ${outcome.order} - NOT printed: ${outcome.reason}`;
 }
 
-function renderDoorPrintTable() {
-  doorPrintBody.innerHTML = '';
-  const rows = [...doorPrintSettings.stations].sort((a, b) => Number(b.enabled) - Number(a.enabled));
+function renderTempLabelTable() {
+  tl.body.innerHTML = '';
+  const rows = [...tempLabelSettings.stations].sort((a, b) => Number(b.enabled) - Number(a.enabled));
   for (const rule of rows) {
     const tr = document.createElement('tr');
     const stationCell = document.createElement('td');
@@ -857,32 +960,65 @@ function renderDoorPrintTable() {
     printerCell.textContent = rule.printerName ? `${rule.printerName}${missing ? ' (not found on this PC)' : ''}` : '-';
     if (missing) printerCell.className = 'failed';
     const lastCell = document.createElement('td');
-    const outcome = doorPrintLastOutcome.get(rule.stationKey);
-    lastCell.textContent = outcome ? describeDoorPrintOutcome(outcome) : '-';
+    const outcome = tempLabelLastOutcome.get(rule.stationKey);
+    lastCell.textContent = outcome ? describeTempLabelOutcome(outcome) : '-';
     if (outcome && outcome.result === 'failed') lastCell.className = 'failed';
     tr.append(stationCell, statusCell, printerCell, lastCell);
-    doorPrintBody.appendChild(tr);
+    tl.body.appendChild(tr);
   }
   const other = document.createElement('tr');
   const cell = document.createElement('td');
   cell.colSpan = 4;
   cell.className = 'hint';
-  cell.textContent = rows.length > 0 ? 'Every other station: disabled.' : 'No station prints on general door codes yet.';
+  cell.textContent = rows.length > 0 ? 'Every other station: disabled.' : 'No station prints temporary labels yet.';
   other.appendChild(cell);
-  doorPrintBody.appendChild(other);
+  tl.body.appendChild(other);
+  renderTempTestStations();
 }
 
-// Shows the selected station's saved rule in the editor.
-function showDoorPrintRuleInEditor() {
-  const rule = doorPrintRule(doorPrintStationSelect.value);
-  doorPrintEnabledInput.checked = Boolean(rule && rule.enabled);
+function renderTempTestStations() {
+  const previous = tl.testStation.value;
+  tl.testStation.innerHTML = '';
+  const withPrinter = tempLabelSettings.stations.filter((row) => row.printerName);
+  if (withPrinter.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Save a station with a printer first';
+    tl.testStation.appendChild(option);
+    tl.testBtn.disabled = true;
+    return;
+  }
+  for (const row of withPrinter) {
+    const option = document.createElement('option');
+    option.value = row.stationKey;
+    option.textContent = `${STATION_LABELS.get(row.stationKey) || row.stationKey} - ${row.printerName}`;
+    tl.testStation.appendChild(option);
+  }
+  if (withPrinter.some((row) => row.stationKey === previous)) tl.testStation.value = previous;
+  tl.testBtn.disabled = false;
+}
+
+function showTempLabelRuleInEditor() {
+  const rule = tempLabelRule(tl.station.value);
+  tl.enabled.checked = Boolean(rule && rule.enabled);
   const printerName = rule ? rule.printerName : '';
-  if (printerName) ensureOptionExists(doorPrintPrinterSelect, printerName);
-  doorPrintPrinterSelect.value = printerName;
-  doorPrintRemoveBtn.disabled = !rule;
+  if (printerName) ensureOptionExists(tl.printer, printerName);
+  tl.printer.value = printerName;
+  tl.removeBtn.disabled = !rule;
 }
 
-async function refreshDoorPrintPrinters() {
+function showTempLayout(layout) {
+  for (const [field, input] of Object.entries(tl.layoutInputs)) {
+    if (layout && layout[field] != null) input.value = String(layout[field]);
+  }
+}
+
+function showErrors(el, errors) {
+  el.hidden = !errors || errors.length === 0;
+  el.textContent = errors && errors.length ? errors.join(' ') : '';
+}
+
+async function refreshTempLabelPrinters() {
   let result;
   try {
     result = await window.comBridge.listPrinters();
@@ -890,67 +1026,111 @@ async function refreshDoorPrintPrinters() {
     result = { supported: true, printers: [] };
   }
   installedPrinterNames = result.supported ? result.printers.map((p) => p.name) : null;
-  doorPrintPrinterSelect.innerHTML = '';
+  tl.printer.innerHTML = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
   placeholder.textContent = result.supported ? (result.printers.length ? 'Choose a printer' : 'No printers found') : 'Not available on this platform (Windows only)';
-  doorPrintPrinterSelect.appendChild(placeholder);
+  tl.printer.appendChild(placeholder);
   for (const printer of result.printers || []) {
     const option = document.createElement('option');
     option.value = printer.name;
     option.textContent = printer.isOffline ? `${printer.name} (offline)` : printer.name;
-    doorPrintPrinterSelect.appendChild(option);
+    tl.printer.appendChild(option);
   }
-  showDoorPrintRuleInEditor();
-  renderDoorPrintTable();
+  showTempLabelRuleInEditor();
+  renderTempLabelTable();
 }
 
-function showDoorPrintErrors(errors) {
-  doorPrintError.hidden = !errors || errors.length === 0;
-  doorPrintError.textContent = errors && errors.length ? errors.join(' ') : '';
-}
-
-async function saveDoorPrintStations(stations) {
-  const result = await window.comBridge.saveDoorPrintSettings({ stations });
+async function saveTempLabelStations(stations) {
+  const result = await window.tempLabels.saveStations(stations);
   if (!result.ok) {
-    showDoorPrintErrors(result.errors);
+    showErrors(tl.error, result.errors);
     return;
   }
-  showDoorPrintErrors(null);
-  doorPrintSettings = result.settings;
-  flashSaved(doorPrintSavedFlash);
-  showDoorPrintRuleInEditor();
-  renderDoorPrintTable();
+  showErrors(tl.error, null);
+  tempLabelSettings = result.settings;
+  flashSaved(tl.saved);
+  showTempLabelRuleInEditor();
+  renderTempLabelTable();
 }
 
-doorPrintStationSelect.addEventListener('change', () => {
-  showDoorPrintErrors(null);
-  showDoorPrintRuleInEditor();
+tl.station.addEventListener('change', () => {
+  showErrors(tl.error, null);
+  showTempLabelRuleInEditor();
 });
 
-doorPrintSaveBtn.addEventListener('click', () => {
-  const stationKey = doorPrintStationSelect.value;
-  const row = { stationKey, enabled: doorPrintEnabledInput.checked, printerName: doorPrintPrinterSelect.value };
-  const others = doorPrintSettings.stations.filter((r) => r.stationKey !== stationKey);
-  saveDoorPrintStations([...others, row]);
+tl.saveBtn.addEventListener('click', () => {
+  const stationKey = tl.station.value;
+  const row = { stationKey, enabled: tl.enabled.checked, printerName: tl.printer.value };
+  const others = tempLabelSettings.stations.filter((r) => r.stationKey !== stationKey);
+  saveTempLabelStations([...others, row]);
 });
 
-doorPrintRemoveBtn.addEventListener('click', () => {
-  const stationKey = doorPrintStationSelect.value;
-  saveDoorPrintStations(doorPrintSettings.stations.filter((r) => r.stationKey !== stationKey));
+tl.removeBtn.addEventListener('click', () => {
+  const stationKey = tl.station.value;
+  saveTempLabelStations(tempLabelSettings.stations.filter((r) => r.stationKey !== stationKey));
 });
 
-printerRefreshBtn.addEventListener('click', () => refreshDoorPrintPrinters());
-
-window.comBridge.onGeneralDoorPrintEvent((outcome) => {
-  doorPrintLastOutcome.set(outcome.stationKey, outcome);
-  renderDoorPrintTable();
+tl.layoutSaveBtn.addEventListener('click', async () => {
+  const layout = {};
+  for (const [field, input] of Object.entries(tl.layoutInputs)) layout[field] = Number(input.value);
+  const result = await window.tempLabels.saveLayout(layout);
+  if (!result.ok) {
+    showErrors(tl.layoutError, result.errors);
+    return;
+  }
+  showErrors(tl.layoutError, null);
+  tempLabelSettings = result.settings;
+  showTempLayout(result.settings.layout);
+  flashSaved(tl.layoutSaved);
 });
 
-async function initDoorPrint() {
-  populateStationSelect(doorPrintStationSelect);
-  doorPrintSettings = await window.comBridge.getDoorPrintSettings();
-  await refreshDoorPrintPrinters();
+tl.layoutDefaultsBtn.addEventListener('click', () => {
+  // Fills the fields only - "Save Layout" still has to be pressed.
+  showTempLayout(tempLabelDefaults);
+  showErrors(tl.layoutError, null);
+});
+
+tl.refreshBtn.addEventListener('click', async () => {
+  tl.refreshBtn.disabled = true;
+  try {
+    renderTempLabelSource(await window.tempLabels.refresh());
+  } finally {
+    tl.refreshBtn.disabled = false;
+  }
+});
+
+tl.testBtn.addEventListener('click', async () => {
+  const stationKey = tl.testStation.value;
+  if (!stationKey) return;
+  tl.testBtn.disabled = true;
+  tl.testResult.textContent = 'Printing one test label...';
+  try {
+    const result = await window.tempLabels.printTest(stationKey, tl.testCode.value);
+    tl.testResult.textContent = result.ok ? `Test label ${result.code} submitted.` : `Failed: ${result.error}`;
+  } finally {
+    tl.testBtn.disabled = false;
+  }
+});
+
+printerRefreshBtn.addEventListener('click', () => refreshTempLabelPrinters());
+
+window.tempLabels.onSourceStatus((status) => renderTempLabelSource(status));
+
+window.tempLabels.onEvent((outcome) => {
+  tempLabelLastOutcome.set(outcome.stationKey, outcome);
+  renderTempLabelTable();
+});
+
+async function initTempLabels() {
+  populateStationSelect(tl.station);
+  const loaded = await window.tempLabels.getSettings();
+  tempLabelSettings = loaded.settings;
+  tempLabelDefaults = loaded.defaults;
+  showTempLayout(loaded.settings.layout);
+  renderTempLabelSource(loaded.status);
+  renderTempKeyStatus(await window.tempLabels.getKeyStatus());
+  await refreshTempLabelPrinters();
 }
 
 // ---- Pinned tab buttons (Dashboard, Delivery Photos - always present, not closable) ----
@@ -1048,7 +1228,7 @@ async function init() {
 
   await refreshPrinterList();
   await checkConfiguredPrinterStatus();
-  await initDoorPrint();
+  await initTempLabels();
 }
 
 init();

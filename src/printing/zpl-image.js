@@ -221,4 +221,4 @@ function buildTestPatternZpl({ widthMm, heightMm, dpi }) {
   return lines.join('\n');
 }
 
-module.exports = { mmToDots, pngBufferToZplLabel, buildTestPatternZpl };
+module.exports = { mmToDots, pngBufferToZplLabel, buildTestPatternZpl, LABEL_SHIFT_X_MM, LABEL_SHIFT_Y_MM };

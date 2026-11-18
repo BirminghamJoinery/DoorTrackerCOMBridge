@@ -21,9 +21,9 @@ function deriveApiBase(comScansApiUrl) {
   }
 }
 
-async function fetchJson(url, options) {
+async function fetchJson(url, options, timeoutMs = API_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
@@ -98,26 +98,31 @@ async function reprintJob(apiBase, jobId) {
   return { ok: true, job: result.data && result.data.printJob };
 }
 
-// Asks the website to create an order's normal label job — see
-// POST /api/print-jobs/order in the website project, which builds it with
-// the same profile/labels/PRINT_JOBS row as every other label job. Used only
-// by General Door Code Printing (general-door-trigger.js); the returned job
-// goes to the same print-job processor as every other job.
-async function createOrderLabelJob(apiBase, { order, stationKey, device, source }) {
-  if (!apiBase) return { ok: false, error: 'No API URL configured.' };
+// Reads the temporary-label source (Order Number -> Temp Label Qty) - see
+// GET /api/temp-labels in the website project, which reads the Google Sheet
+// with the website's own service account. Used only by Temporary Data Matrix
+// Printing's periodic/manual refresh (temp-labels/source-cache.js), never on
+// a scan. A longer timeout than scans use: a whole-sheet read can be slow,
+// and nothing waits on it.
+//
+// Authenticated with "Authorization: Bearer <access key>" - the same scheme
+// as the website's Photo Bridge endpoints; the website only knows the key's
+// SHA-256 (TEMP_LABELS_KEY_SHA256). See temp-labels/access-key.js. With no
+// key set on this PC nothing is requested at all.
+const TEMP_LABEL_SOURCE_TIMEOUT_MS = 20000;
 
-  const result = await fetchJson(`${apiBase}/api/print-jobs/order`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ order, station_key: stationKey, device, source })
-  });
-
-  if (!result.ok) {
-    return { ok: false, error: result.error };
-  }
-  const job = result.data && result.data.printJob;
-  if (!job || !job.jobId) return { ok: false, error: 'The website did not return a print job.' };
-  return { ok: true, job };
+async function fetchTempLabelSource(apiBase, accessKey) {
+  if (!apiBase) return { ok: false, error: 'No Server API URL configured.' };
+  if (!accessKey) return { ok: false, error: 'No website access key is set on this PC - generate one under Temporary Data Matrix Printing.' };
+  const result = await fetchJson(
+    `${apiBase}/api/temp-labels`,
+    { method: 'GET', headers: { Authorization: `Bearer ${accessKey}` } },
+    TEMP_LABEL_SOURCE_TIMEOUT_MS
+  );
+  if (!result.ok) return { ok: false, error: result.error };
+  const rows = result.data && result.data.rows;
+  if (!Array.isArray(rows)) return { ok: false, error: 'The website did not return temporary-label rows.' };
+  return { ok: true, rows, sheetName: (result.data && result.data.sheetName) || '' };
 }
 
-module.exports = { deriveApiBase, reportJobStatus, fetchPendingJobs, reprintJob, createOrderLabelJob };
+module.exports = { deriveApiBase, reportJobStatus, fetchPendingJobs, reprintJob, fetchTempLabelSource };
