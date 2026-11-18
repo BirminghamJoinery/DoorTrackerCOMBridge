@@ -202,15 +202,25 @@ function createTempLabelSource({ cachePath, fetchRows, logger, now = () => new D
   }
 
   // Single-flight: a manual refresh during a timed one waits for that one.
+  //
+  // Always returns THIS call's promise (held in a local), never a re-read of
+  // the shared `refreshing` variable, which the .finally() below resets to
+  // null. When there is nothing to fetch (no Server API URL, no access key)
+  // doRefresh() settles on microtasks alone, and Electron's main process can
+  // drain microtasks synchronously inside a native call such as the
+  // webContents.send() that notify() makes - so by the time a re-read
+  // happened, `refreshing` could already be null again, and the 5-minute
+  // timer's refresh('scheduled').catch(...) crashed the app with
+  // "Cannot read properties of null (reading 'catch')".
   function refresh(reason = 'scheduled') {
-    if (!refreshing) {
-      refreshing = doRefresh(reason).finally(() => {
-        refreshing = null;
-        notify();
-      });
+    if (refreshing) return refreshing;
+    const run = doRefresh(reason).finally(() => {
+      if (refreshing === run) refreshing = null;
       notify();
-    }
-    return refreshing;
+    });
+    refreshing = run;
+    notify();
+    return run;
   }
 
   // { ok: true, qty } or { ok: false, reason } - in-memory, never the network.
