@@ -218,18 +218,47 @@ async function dataMatrixPng(text) {
 // runner did exactly that. Fails with a clear message if the camera has
 // stopped producing frames at all.
 async function nextCameraFrame(page) {
-  const ok = await page.evaluate(
+  const result = await page.evaluate(
     () =>
       new Promise((resolve) => {
         const video = document.getElementById('capture-video');
-        const timer = setTimeout(() => resolve(false), 15000);
+        const startedAt = video.currentTime;
+        // On a timeout, report what the preview was actually doing, so a
+        // failure on a machine nobody is watching still says why.
+        const timer = setTimeout(() => {
+          const track = video.srcObject && video.srcObject.getVideoTracks ? video.srcObject.getVideoTracks()[0] : null;
+          const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+          resolve({
+            ok: false,
+            state: {
+              paused: video.paused,
+              readyState: video.readyState,
+              currentTime: [startedAt, video.currentTime],
+              videoWidth: video.videoWidth,
+              sameStreamAsScanVideo: Boolean(video.srcObject) && video.srcObject === document.getElementById('scan-video').srcObject,
+              track: track && { readyState: track.readyState, muted: track.muted, enabled: track.enabled },
+              totalVideoFrames: quality && quality.totalVideoFrames,
+              visibility: document.visibilityState,
+              hasFocus: document.hasFocus()
+            }
+          });
+        }, 15000);
         video.requestVideoFrameCallback(() => {
           clearTimeout(timer);
-          resolve(true);
+          resolve({ ok: true });
         });
       })
   );
-  assert.ok(ok, 'the camera preview produced no new frame within 15 seconds');
+  // An ENDED track means Chrome's fake camera itself stopped, not the page:
+  // the page never stops its camera while capturing. That happens when the
+  // machine is starved of CPU (seen on a 15 W laptop running the whole suite;
+  // Chrome then also fails to find the fake device at all) - rerun this file
+  // on its own to check, before suspecting the app.
+  const cameraDied = result.state && result.state.track && result.state.track.readyState === 'ended';
+  assert.ok(
+    result.ok,
+    `the camera preview produced no new frame within 15 seconds${cameraDied ? " - Chrome's fake camera track ENDED (the browser's capture device stopped, usually CPU starvation on this machine; the page did not stop it)" : ''}: ${JSON.stringify(result.state)}`
+  );
 }
 
 async function pressShutter(page, alreadyTaken) {
@@ -627,11 +656,16 @@ async function codePng(format, text) {
 // getUserMedia() returns the canvas's own video stream, so the real scanning
 // loop (scanner.js), the real decoder and the real role check all run on
 // what it shows. A frame counter is drawn in a corner so every photograph
-// taken from it is a different image.
+// taken from it is a different image. The counter starts again on every page
+// load (this script runs again after page.reload()), so a random id for this
+// load is drawn too: without it, a photo taken offline after a reload could
+// be byte-identical to one already filed for the same order before the
+// reload, and the PC (correctly) files an identical photograph only once.
 function fakeCameraScript() {
   let canvas = null;
   let code = null;
   let frame = 0;
+  const loadId = crypto.randomUUID().slice(0, 8);
   function draw() {
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#9aa';
@@ -645,7 +679,7 @@ function fakeCameraScript() {
     }
     ctx.fillStyle = '#000';
     ctx.font = '24px sans-serif';
-    ctx.fillText(`frame ${++frame}`, 20, 40);
+    ctx.fillText(`frame ${++frame} · load ${loadId}`, 20, 40);
   }
   window.__fakeCamera = {
     async show(b64) {

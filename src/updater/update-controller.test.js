@@ -10,12 +10,12 @@ const { EventEmitter } = require('node:events');
 const { createUpdateController } = require('./update-controller');
 const { installerName } = require('./releases');
 
-const BASE = 'https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases/download';
+const BASE = 'https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/download';
 
 function apiRelease(version, fields = {}) {
   const tag = `v${version}`;
   const asset = (name) => ({ name, browser_download_url: `${BASE}/${tag}/${name}`, size: 1000 });
-  return { tag_name: tag, draft: false, prerelease: false, published_at: '2026-11-03T10:00:00Z', html_url: `https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases/tag/${tag}`, assets: [asset(installerName(version)), asset('latest.yml')], ...fields };
+  return { tag_name: tag, draft: false, prerelease: false, published_at: '2026-11-03T10:00:00Z', html_url: `https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/tag/${tag}`, assets: [asset(installerName(version)), asset('latest.yml')], ...fields };
 }
 
 const GOOD_INFO = (version) => ({ version, files: [{ url: installerName(version), sha512: 'a'.repeat(88), size: 1000 }] });

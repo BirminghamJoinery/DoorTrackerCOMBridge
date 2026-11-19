@@ -33,6 +33,19 @@ npm start
 This launches the app via Electron directly from source — use this while
 making changes to the COM port, printing, or Delivery Photos logic.
 
+If the window never opens and Electron behaves like plain Node, the shell has
+`ELECTRON_RUN_AS_NODE` set. VS Code sets it for processes started by
+extensions (including AI coding assistants' terminals); VS Code's own
+integrated terminal removes it. Clear it for that shell first:
+`Remove-Item Env:ELECTRON_RUN_AS_NODE` (PowerShell) or
+`unset ELECTRON_RUN_AS_NODE` (macOS/Linux).
+
+**Building the installer on your own Windows PC** (`npm run dist:win`) needs
+permission to create symbolic links, because electron-builder unpacks a
+code-signing toolkit that contains some. Turn on **Settings → System → For
+developers → Developer mode** (one-time; needs administrator approval), then
+run it from a normal, non-elevated terminal. GitHub Actions needs nothing.
+
 ## Delivery Photos
 
 Configured from its own tab in the app (**Delivery Photos**): a local
@@ -275,7 +288,7 @@ Everything lands in the `dist/` folder at the project root, including:
 ## Updates (GitHub Releases)
 
 The **Updates** tab installs a packaged release from this repository's
-[GitHub Releases](https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases) -
+[GitHub Releases](https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases) -
 never source code from `main`. Nothing happens on its own: **Check for
 Updates**, **Download Update** and **Restart and Install** are each a button
 press, and the install is confirmed first ("The COM Bridge will close

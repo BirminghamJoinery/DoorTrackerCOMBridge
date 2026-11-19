@@ -18,7 +18,10 @@
 
 const nodePath = require('node:path');
 
-const OWNER = 'jamesjhdyer';
+// The repository's current owner. It was transferred from jamesjhdyer in
+// November 2026; GitHub now reports every asset URL under this owner, so
+// the URL checks below must use it (and package.json's build.publish.owner).
+const OWNER = 'BirminghamJoinery';
 const REPO = 'DoorTrackerCOMBridge';
 const METADATA_NAME = 'latest.yml';
 const MAX_RELEASES = 20;

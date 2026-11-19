@@ -11,6 +11,28 @@ const archive = require('./archive');
 const fsOps = require('./fs-ops');
 const { makeEnv, jpeg } = require('./helpers');
 
+// The drive-letter and UNC roots named in the path-rule tests below are
+// SIMULATED, never looked up for real: whichever PC runs the tests may have
+// that letter mapped to a real company share (S: is, on the office and
+// workshop PCs), and looking up a UNC path is real network traffic. An lstat
+// of a simulated root fails the way a missing folder does, and the drive's
+// own state comes from `driveConnected`. Every other path still uses the real
+// filesystem. Returns the drive letters the code asked about.
+function simulateRoots(t, simulatedRoots, { driveConnected }) {
+  const realLstat = fsp.lstat;
+  const isSimulated = (p) => simulatedRoots.some((root) => String(p).toLowerCase().startsWith(root.toLowerCase()));
+  t.mock.method(fsp, 'lstat', async (p, ...rest) => {
+    if (isSimulated(p)) throw Object.assign(new Error('ENOENT: no such file or directory (simulated)'), { code: 'ENOENT' });
+    return realLstat.call(fsp, p, ...rest);
+  });
+  const drivesChecked = [];
+  t.mock.method(fsOps, 'driveRootReachable', async (drive) => {
+    drivesChecked.push(drive);
+    return driveConnected;
+  });
+  return drivesChecked;
+}
+
 async function writeSpool(env, bytes, name = `${randomUUID()}.jpg`) {
   const spoolPath = nodePath.join(env.spool, name);
   await fsp.mkdir(env.spool, { recursive: true });
@@ -62,12 +84,14 @@ test('probeRoot refuses a root with an invalid shape (relative path)', async () 
 // path and a mapped drive letter are legitimate production archive roots.
 // What must never weaken is the SHAPE check: relative paths are still
 // refused outright, and only for that reason.
-test('production Windows path rules: UNC and every drive letter are accepted by checkRoot; a relative path is refused', async () => {
+test('production Windows path rules: UNC and every drive letter are accepted by checkRoot; a relative path is refused', async (t) => {
   const unc = '\\\\SERVER\\Share\\Delivery Photographs';
+  const driveLetterRoot = 'D:\\a\\DoorTrackerCOMBridge\\DoorTrackerCOMBridge\\Temp\\dp-test-abc123\\share';
+  simulateRoots(t, [unc, driveLetterRoot], { driveConnected: false });
   await assert.rejects(archive.probeRoot({ root: unc, platform: 'win32' }), (err) => {
     assert.ok(err instanceof archive.ArchiveError);
-    // Fails only because \\SERVER doesn't really exist on the machine running
-    // this test, never because the UNC shape itself was refused.
+    // Fails only because the simulated \\SERVER share is missing, never
+    // because the UNC shape itself was refused.
     assert.doesNotMatch(err.message, /is not usable/, `must pass the shape check - got: ${err.message}`);
     return true;
   });
@@ -75,7 +99,6 @@ test('production Windows path rules: UNC and every drive letter are accepted by 
   // This is the exact shape of the bug that once broke the GitHub Actions
   // Windows build: that runner's own temp/checkout folders live on a D:\
   // drive, so a real local test folder is a genuine drive-letter path there.
-  const driveLetterRoot = 'D:\\a\\DoorTrackerCOMBridge\\DoorTrackerCOMBridge\\Temp\\dp-test-abc123\\share';
   await assert.rejects(archive.probeRoot({ root: driveLetterRoot, platform: 'win32' }), (err) => {
     assert.ok(err instanceof archive.ArchiveError);
     assert.doesNotMatch(err.message, /is not usable/, `must pass the shape check - got: ${err.message}`);
@@ -89,12 +112,27 @@ test('production Windows path rules: UNC and every drive letter are accepted by 
   });
 });
 
-test('a mapped drive letter that is not reachable reports a clear, specific message naming the drive', async () => {
+test('a mapped drive letter that is not reachable reports a clear, specific message naming the drive', async (t) => {
+  const drivesChecked = simulateRoots(t, ['S:\\'], { driveConnected: false });
   await assert.rejects(archive.probeRoot({ root: 'S:\\Delivery Photographs', platform: 'win32' }), (err) => {
     assert.ok(err instanceof archive.ArchiveError);
+    assert.equal(err.code, 'ROOT_NOT_FOUND');
     assert.match(err.message, /Network drive unavailable — waiting for S:/, `must name the drive it is waiting for - got: ${err.message}`);
     return true;
   });
+  assert.deepEqual(drivesChecked, ['S']);
+});
+
+test('a mapped drive letter that IS connected, but whose folder is missing, is not blamed on the drive', async (t) => {
+  const drivesChecked = simulateRoots(t, ['S:\\'], { driveConnected: true });
+  await assert.rejects(archive.probeRoot({ root: 'S:\\Delivery Photographs', platform: 'win32' }), (err) => {
+    assert.ok(err instanceof archive.ArchiveError);
+    assert.equal(err.code, 'ROOT_NOT_FOUND');
+    assert.match(err.message, /the S: drive is connected, but the configured folder does not exist on it/);
+    assert.doesNotMatch(err.message, /Network drive unavailable/);
+    return true;
+  });
+  assert.deepEqual(drivesChecked, ['S']);
 });
 
 test('archivePhoto files the first photograph as <order>/001-DELIV.jpg and verifies it by reading it back', async () => {

@@ -1,0 +1,22 @@
+# Text files are stored with LF and checked out with LF on every OS, so a
+# Windows checkout is byte-identical to a macOS one (whatever the machine's
+# core.autocrlf), and tests that read files as text behave the same everywhere.
+* text=auto eol=lf
+
+# Windows batch files need CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binary files: never converted or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.wasm binary
+*.exe binary
+*.pdf binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary

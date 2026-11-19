@@ -7,7 +7,7 @@ const nodePath = require('node:path');
 const releases = require('./releases');
 const { compareVersions, parseVersion, selectStableReleases, checkUpdateInfo, isPathInside, installerName, fetchReleases } = releases;
 
-const BASE = 'https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases/download';
+const BASE = 'https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/download';
 
 // One GitHub API release object, as /repos/{owner}/{repo}/releases returns it.
 function apiRelease(version, overrides = {}) {
@@ -19,7 +19,7 @@ function apiRelease(version, overrides = {}) {
     draft: false,
     prerelease: false,
     published_at: '2026-11-03T10:00:00Z',
-    html_url: `https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases/tag/${tag}`,
+    html_url: `https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/tag/${tag}`,
     assets: overrides.assets || [asset(installerName(version)), asset(`${installerName(version)}.blockmap`), asset('latest.yml'), asset(`DoorTrackerCOMBridge-Portable-${version}.exe`)],
     ...overrides.fields
   };
@@ -58,6 +58,20 @@ test('a release whose assets point at another repository is rejected', () => {
     apiRelease('1.3.0', { assets: [{ name: installerName('1.3.0'), browser_download_url: `${other}/${installerName('1.3.0')}` }, { name: 'latest.yml', browser_download_url: `${other}/latest.yml` }] }),
     apiRelease('1.2.9', { assets: [{ name: installerName('1.2.9'), browser_download_url: `https://evil.example.com/${installerName('1.2.9')}` }, { name: 'latest.yml', browser_download_url: `${BASE}/v1.2.9/latest.yml` }] }),
     apiRelease('1.2.8', { assets: [{ name: installerName('1.2.8'), browser_download_url: `${BASE}/v1.2.7/${installerName('1.2.8')}` }, { name: 'latest.yml', browser_download_url: `${BASE}/v1.2.8/latest.yml` }] })
+  ]);
+  assert.deepEqual(list, []);
+});
+
+test('after the repository transfer, GitHub reports assets under BirminghamJoinery: those are accepted, the old owner is not', () => {
+  assert.equal(releases.OWNER, 'BirminghamJoinery');
+  assert.equal(releases.REPO, 'DoorTrackerCOMBridge');
+  const [accepted] = selectStableReleases([apiRelease('1.3.1')]);
+  assert.equal(accepted.feedUrl, 'https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/download/v1.3.1/');
+  assert.equal(accepted.notesUrl, 'https://github.com/BirminghamJoinery/DoorTrackerCOMBridge/releases/tag/v1.3.1');
+
+  const old = 'https://github.com/jamesjhdyer/DoorTrackerCOMBridge/releases/download/v1.3.1';
+  const list = selectStableReleases([
+    apiRelease('1.3.1', { assets: [{ name: installerName('1.3.1'), browser_download_url: `${old}/${installerName('1.3.1')}` }, { name: 'latest.yml', browser_download_url: `${old}/latest.yml` }] })
   ]);
   assert.deepEqual(list, []);
 });
@@ -115,7 +129,7 @@ test('fetchReleases asks the public GitHub API for this repository with no crede
   };
   const json = await fetchReleases(fakeFetch);
   assert.equal(json.length, 1);
-  assert.match(seen.url, /^https:\/\/api\.github\.com\/repos\/jamesjhdyer\/DoorTrackerCOMBridge\/releases\b/);
+  assert.match(seen.url, /^https:\/\/api\.github\.com\/repos\/BirminghamJoinery\/DoorTrackerCOMBridge\/releases\b/);
   assert.equal(Object.keys(seen.options.headers).some((h) => h.toLowerCase() === 'authorization'), false);
 
   await assert.rejects(fetchReleases(async () => ({ ok: false, status: 403 })), (err) => err.status === 403);

@@ -69,7 +69,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "jamesjhdyer",
+        "owner": "BirminghamJoinery",
         "repo": "DoorTrackerCOMBridge",
         "releaseType": "draft"
       }

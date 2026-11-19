@@ -21,7 +21,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const nodePath = require('node:path');
 const asar = require('@electron/asar');
-const { installerName } = require('../src/updater/releases');
+const { installerName, OWNER, REPO } = require('../src/updater/releases');
 
 const root = nodePath.join(__dirname, '..');
 const dist = nodePath.resolve(process.argv[2] || nodePath.join(root, 'dist'));
@@ -51,7 +51,8 @@ const resources = nodePath.join(dist, 'win-unpacked', 'resources');
 const updateConfig = nodePath.join(resources, 'app-update.yml');
 if (check(fs.existsSync(updateConfig), 'Missing win-unpacked/resources/app-update.yml')) {
   const text = fs.readFileSync(updateConfig, 'utf8');
-  check(/owner: jamesjhdyer/.test(text) && /repo: DoorTrackerCOMBridge/.test(text), 'app-update.yml does not point at jamesjhdyer/DoorTrackerCOMBridge');
+  // Must be the same repository the in-app updater checks (src/updater/releases.js).
+  check(new RegExp(`^owner: ${OWNER}$`, 'm').test(text) && new RegExp(`^repo: ${REPO}$`, 'm').test(text), `app-update.yml does not point at ${OWNER}/${REPO}`);
 }
 
 const asarPath = nodePath.join(resources, 'app.asar');
