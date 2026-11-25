@@ -64,6 +64,7 @@ if (check(fs.existsSync(asarPath), 'Missing win-unpacked/resources/app.asar')) {
     '/src/index.html',
     '/src/renderer.js',
     '/src/com-options.js',
+    '/src/init-sections.js',
     '/src/com-settings.js',
     '/src/updater/releases.js',
     '/src/updater/update-controller.js',

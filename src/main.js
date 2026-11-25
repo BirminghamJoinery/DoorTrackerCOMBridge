@@ -664,7 +664,42 @@ ipcMain.handle('save-settings', async (event, settings) => {
 // "not supported on this platform" result on macOS, never a crash, so
 // normal development doesn't need Windows printer access to succeed.
 
-ipcMain.handle('list-printers', async () => windowsPrinter.listPrinters());
+// One printer discovery, logged: that it started, how many printers it found
+// (and how), or exactly why it failed - timed out / exit code / PowerShell's
+// own stderr. Never rejects: a failure comes back as
+// { supported: true, printers: [], error } so the window shows it beside the
+// printer dropdowns and nothing else on the page depends on it.
+async function discoverPrinters(reason) {
+  comLogger.info(`Printer discovery started (${reason}).`);
+  try {
+    const result = await windowsPrinter.listPrinters();
+    if (!result.supported) return result;
+    const how = result.method === 'temp-file' ? 'temporary .ps1 fallback' : 'inline PowerShell';
+    const names = result.printers.map((p) => p.name).join(', ');
+    const warnings = result.warnings && result.warnings.length ? ` Warnings: ${result.warnings.join(' | ')}` : '';
+    comLogger.info(`Printer discovery found ${result.printers.length} printer(s) in ${result.elapsedMs}ms (${how})${names ? `: ${names.slice(0, 600)}` : ''}.${warnings}`);
+    return result;
+  } catch (err) {
+    const diagnostics = err.diagnostics ? ` Diagnostics: ${JSON.stringify(err.diagnostics)}` : '';
+    comLogger.warn(`Printer discovery failed (${reason}): ${err.message}.${diagnostics}`);
+    return { supported: true, printers: [], error: err.message };
+  }
+}
+
+ipcMain.handle('list-printers', async () => discoverPrinters('window'));
+
+// Start-up/diagnostic lines from the window itself (which sections of the
+// page loaded, how many stations/printers, what failed) - written to this
+// PC's COM Bridge log so a blank form can be explained afterwards. The
+// renderer only ever sends counts and error messages, never settings
+// values or keys; the text is still flattened and capped here.
+ipcMain.handle('log-renderer-diagnostic', async (event, { level, message } = {}) => {
+  const text = String(message == null ? '' : message).replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 800);
+  if (!text) return { ok: false };
+  if (level === 'warn') comLogger.warn(`Window: ${text}`);
+  else comLogger.info(`Window: ${text}`);
+  return { ok: true };
+});
 
 ipcMain.handle('get-printer-name', async () => printerSettings.getPrinterName());
 
@@ -741,12 +776,11 @@ ipcMain.handle('get-temp-label-settings', async () => ({
 
 ipcMain.handle('save-temp-label-stations', async (event, stations) => {
   let installedPrinters;
-  try {
-    const listed = await windowsPrinter.listPrinters();
-    if (listed.supported) installedPrinters = listed.printers.map((p) => p.name);
-  } catch (err) {
-    return { ok: false, errors: [`Could not read the installed printers: ${err.message}`] };
+  const listed = await discoverPrinters('saving Temporary Data Matrix stations');
+  if (listed.error) {
+    return { ok: false, errors: [`Could not read the installed printers: ${listed.error}`] };
   }
+  if (listed.supported) installedPrinters = listed.printers.map((p) => p.name);
   let result;
   try {
     result = tempLabelSettings.saveTempLabelSettings(TEMP_LABEL_SETTINGS_PATH(), { stations, layout: loadTempLabelSettings().layout }, { installedPrinters });

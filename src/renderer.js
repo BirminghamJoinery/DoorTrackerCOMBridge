@@ -1,6 +1,8 @@
 // Stations and baud rates come from com-options.js (loaded just before this
 // file) - the same list Remote Admin validates against.
 const { STATION_GROUPS, BAUD_RATES, DEFAULT_BAUD_RATE } = window.ComOptions;
+// Start-up runs as independent sections - see init-sections.js and init().
+const { runSection, summarizeInit } = window.InitSections;
 
 const STATIONS = STATION_GROUPS.flatMap((g) => g.stations);
 const STATION_LABELS = new Map(STATIONS.map((s) => [s.key, s.label]));
@@ -75,6 +77,7 @@ const printerCheckBtn = document.getElementById('printer-check-btn');
 const printerSavedFlash = document.getElementById('printer-saved');
 const printerStatusBadge = document.getElementById('printer-status-badge');
 const printerStatusMessage = document.getElementById('printer-status-message');
+const printerListError = document.getElementById('printer-list-error');
 const testWidthMmInput = document.getElementById('test-width-mm');
 const testHeightMmInput = document.getElementById('test-height-mm');
 const printTestPatternBtn = document.getElementById('print-test-pattern-btn');
@@ -715,11 +718,49 @@ function setPrinterStatusBadge(status, message) {
   printerStatusMessage.textContent = message || '';
 }
 
-async function refreshPrinterList() {
-  const desired = printerSelect.value;
-  const result = await window.comBridge.listPrinters();
+// ONE Windows printer discovery, shared by both printer dropdowns (this
+// panel's and Temporary Data Matrix Printing's) - previously each ran its
+// own. Never rejects: a failure comes back as
+// { supported: true, printers: [], error } - main.js already returns that
+// shape and logs why; a rejected IPC call is folded into it here too.
+async function fetchPrinters() {
+  try {
+    const result = await window.comBridge.listPrinters();
+    if (!result || !Array.isArray(result.printers)) {
+      return { supported: true, printers: [], error: 'Printer discovery returned no list.' };
+    }
+    return result;
+  } catch (err) {
+    return { supported: true, printers: [], error: err && err.message ? err.message : String(err) };
+  }
+}
 
+function showPrinterDiscoveryError(el, error) {
+  el.hidden = !error;
+  el.textContent = error ? `Could not read the installed printers: ${error}` : '';
+}
+
+// Fills this panel's printer dropdown from a fetchPrinters() result. Throws
+// after showing the error when discovery failed, so start-up records this
+// section as failed - nothing else depends on it.
+async function renderPrinterList(result) {
+  const desired = printerSelect.value;
   printerSelect.innerHTML = '';
+  showPrinterDiscoveryError(printerListError, result.error);
+
+  if (result.error) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Could not list printers (see below)';
+    option.disabled = true;
+    printerSelect.appendChild(option);
+    const configured = await window.comBridge.getPrinterName();
+    if (configured) {
+      ensureOptionExists(printerSelect, configured);
+      printerSelect.value = configured;
+    }
+    throw new Error(result.error);
+  }
 
   if (!result.supported) {
     const option = document.createElement('option');
@@ -727,7 +768,7 @@ async function refreshPrinterList() {
     option.textContent = 'Not available on this platform (Windows only)';
     option.disabled = true;
     printerSelect.appendChild(option);
-    return;
+    return 'not available on this platform';
   }
 
   if (result.printers.length === 0) {
@@ -736,7 +777,7 @@ async function refreshPrinterList() {
     option.textContent = 'No printers found';
     option.disabled = true;
     printerSelect.appendChild(option);
-    return;
+    return '0 printers';
   }
 
   for (const printer of result.printers) {
@@ -752,6 +793,17 @@ async function refreshPrinterList() {
     ensureOptionExists(printerSelect, toSelect);
     printerSelect.value = toSelect;
   }
+  const warning = result.details && result.details !== 'ok' ? ' (offline/default flags unavailable)' : '';
+  return `${result.printers.length} printer(s)${warning}`;
+}
+
+// Refresh button: one discovery, both dropdowns.
+async function refreshPrinters() {
+  const result = await fetchPrinters();
+  await Promise.all([
+    renderPrinterList(result).catch(() => {}),
+    Promise.resolve().then(() => renderTempLabelPrinters(result))
+  ]);
 }
 
 async function checkConfiguredPrinterStatus() {
@@ -761,7 +813,13 @@ async function checkConfiguredPrinterStatus() {
     return;
   }
 
-  const status = await window.comBridge.getPrinterStatus(configuredName);
+  let status;
+  try {
+    status = await window.comBridge.getPrinterStatus(configuredName);
+  } catch (err) {
+    setPrinterStatusBadge('error', `${configuredName} — could not check status: ${err && err.message ? err.message : err}`);
+    throw err;
+  }
   if (!status.supported) {
     setPrinterStatusBadge('error', `${configuredName} — not checkable on this platform (Windows only)`);
     return;
@@ -777,7 +835,7 @@ async function checkConfiguredPrinterStatus() {
   setPrinterStatusBadge('connected', configuredName);
 }
 
-printerRefreshBtn.addEventListener('click', () => refreshPrinterList());
+printerRefreshBtn.addEventListener('click', () => refreshPrinters());
 
 printerSaveBtn.addEventListener('click', async () => {
   await window.comBridge.savePrinterName(printerSelect.value);
@@ -810,7 +868,9 @@ reprintTestBtn.addEventListener('click', async () => {
     : `Failed: ${result.error}`;
 });
 
-let installedPrinterNames = null; // null = cannot list printers on this platform
+// null = the installed printers are not known (not Windows, or discovery
+// failed) - the station table then never claims a saved printer is missing.
+let installedPrinterNames = null;
 
 // ---- Temporary Data Matrix Printing ----
 // Per-STATION rule (enabled + printer), the label layout, the source cache
@@ -826,6 +886,7 @@ const tl = {
   station: document.getElementById('temp-label-station'),
   enabled: document.getElementById('temp-label-enabled'),
   printer: document.getElementById('temp-label-printer'),
+  printerError: document.getElementById('temp-label-printer-error'),
   saveBtn: document.getElementById('temp-label-save-btn'),
   removeBtn: document.getElementById('temp-label-remove-btn'),
   saved: document.getElementById('temp-label-saved'),
@@ -1018,18 +1079,21 @@ function showErrors(el, errors) {
   el.textContent = errors && errors.length ? errors.join(' ') : '';
 }
 
-async function refreshTempLabelPrinters() {
-  let result;
-  try {
-    result = await window.comBridge.listPrinters();
-  } catch {
-    result = { supported: true, printers: [] };
-  }
-  installedPrinterNames = result.supported ? result.printers.map((p) => p.name) : null;
+// Fills the Temporary Data Matrix printer dropdown from a fetchPrinters()
+// result. A discovery failure is shown under the dropdown (the station
+// dropdown, layout and everything else are untouched by it), and a station's
+// already-saved printer is still shown, so it can be re-saved or removed.
+// Returns a short description for the start-up log.
+function renderTempLabelPrinters(result) {
+  const failed = Boolean(result.error);
+  installedPrinterNames = result.supported && !failed ? result.printers.map((p) => p.name) : null;
+  showPrinterDiscoveryError(tl.printerError, result.error);
   tl.printer.innerHTML = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
-  placeholder.textContent = result.supported ? (result.printers.length ? 'Choose a printer' : 'No printers found') : 'Not available on this platform (Windows only)';
+  placeholder.textContent = failed
+    ? 'Could not list printers (see below)'
+    : result.supported ? (result.printers.length ? 'Choose a printer' : 'No printers found') : 'Not available on this platform (Windows only)';
   tl.printer.appendChild(placeholder);
   for (const printer of result.printers || []) {
     const option = document.createElement('option');
@@ -1039,6 +1103,7 @@ async function refreshTempLabelPrinters() {
   }
   showTempLabelRuleInEditor();
   renderTempLabelTable();
+  return failed ? 'printer discovery failed - error shown' : `${(result.printers || []).length} printer(s)`;
 }
 
 async function saveTempLabelStations(stations) {
@@ -1113,8 +1178,6 @@ tl.testBtn.addEventListener('click', async () => {
   }
 });
 
-printerRefreshBtn.addEventListener('click', () => refreshTempLabelPrinters());
-
 window.tempLabels.onSourceStatus((status) => renderTempLabelSource(status));
 
 window.tempLabels.onEvent((outcome) => {
@@ -1122,15 +1185,61 @@ window.tempLabels.onEvent((outcome) => {
   renderTempLabelTable();
 });
 
-async function initTempLabels() {
+// Temporary Data Matrix start-up, as independent sections (see init()).
+
+// The station list is bundled with the app (com-options.js) - it needs no
+// IPC, no settings file and no printer, so it is filled first, on its own.
+function initTempLabelStationList() {
   populateStationSelect(tl.station);
-  const loaded = await window.tempLabels.getSettings();
+  showTempLabelRuleInEditor();
+  return `${tl.station.options.length} stations`;
+}
+
+// The saved station rules and label layout.
+async function initTempLabelSettings() {
+  let loaded;
+  try {
+    loaded = await window.tempLabels.getSettings();
+  } catch (err) {
+    showErrors(tl.error, [`Could not load the saved Temporary Data Matrix settings: ${err && err.message ? err.message : err}`]);
+    throw err;
+  }
   tempLabelSettings = loaded.settings;
   tempLabelDefaults = loaded.defaults;
   showTempLayout(loaded.settings.layout);
-  renderTempLabelSource(loaded.status);
-  renderTempKeyStatus(await window.tempLabels.getKeyStatus());
-  await refreshTempLabelPrinters();
+  showTempLabelRuleInEditor();
+  renderTempLabelTable();
+  return `${loaded.settings.stations.length} station rule(s), layout loaded`;
+}
+
+// The website source / local cache status - asked for on its own, so it
+// shows even if the saved settings could not be read.
+async function initTempLabelSource() {
+  let status;
+  try {
+    status = await window.tempLabels.getStatus();
+  } catch (err) {
+    renderTempLabelSource({ state: 'error', lastError: err && err.message ? err.message : String(err), ordersCached: 0 });
+    throw err;
+  }
+  renderTempLabelSource(status);
+  return status ? `${status.state}, ${status.ordersCached} order(s) cached` : 'no status';
+}
+
+// The access key's status. Generate/Replace Access Key has its own click
+// handler and works whatever happens here.
+async function initTempLabelKeyStatus() {
+  let status;
+  try {
+    status = await window.tempLabels.getKeyStatus();
+  } catch (err) {
+    tk.badge.className = 'badge error';
+    tk.badge.textContent = 'Error';
+    tk.detail.textContent = `Could not read the access key status: ${err && err.message ? err.message : err}`;
+    throw err;
+  }
+  renderTempKeyStatus(status);
+  return status && status.set ? 'key set' : 'no key set';
 }
 
 // ---- Pinned tab buttons (Dashboard, Delivery Photos - always present, not closable) ----
@@ -1206,10 +1315,27 @@ window.comBridge.onPrintJobEvent((event) => {
 window.comBridge.onSettingsChanged((settings) => applySavedSettings(settings));
 
 // ---- Init ----
+// Every part of the page loads as its own section (init-sections.js): one
+// failing - Windows printer discovery, a settings file, an IPC call - shows
+// its own error and is logged, and never stops the others. Previously each
+// part was awaited in turn with no error handling, so a printer discovery
+// failure rejected init() before the Temporary Data Matrix station list,
+// layout, source status and key status were ever filled in.
 
-async function init() {
-  populateManualScanStationList();
+// Console + this PC's COM Bridge log (main.js's log-renderer-diagnostic).
+// Counts and error messages only - never settings values or keys.
+function logDiagnostic(level, message) {
+  if (level === 'warn') console.warn(`[COM Bridge] ${message}`);
+  else console.info(`[COM Bridge] ${message}`);
+  try {
+    const sent = window.comBridge.logDiagnostic && window.comBridge.logDiagnostic(level, message);
+    if (sent && typeof sent.catch === 'function') sent.catch(() => {});
+  } catch {
+    // Logging must never break start-up.
+  }
+}
 
+async function loadSettingsAndTabs() {
   const settings = await window.comBridge.loadSettings();
   apiUrl = settings.apiUrl || '';
   apiUrlInput.value = apiUrl;
@@ -1224,14 +1350,56 @@ async function init() {
 
   setActiveTab('dashboard');
   renderConnectionsTable();
-  await refreshAllPorts();
-
-  await refreshPrinterList();
-  await checkConfiguredPrinterStatus();
-  await initTempLabels();
+  return `settings loaded, ${savedTabs.length} tab(s)`;
 }
 
-init();
+async function init() {
+  const started = Date.now();
+  const opts = { log: logDiagnostic };
+
+  // Bundled, local-only lists first - no IPC, nothing to wait for.
+  const results = [
+    await runSection('Temporary label station list', initTempLabelStationList, opts),
+    await runSection('Manual scan station list', () => {
+      populateManualScanStationList();
+      return `${STATIONS.length} stations`;
+    }, opts)
+  ];
+
+  // Then everything that asks the main process, side by side. Printer
+  // discovery (a PowerShell process, the slowest part) runs once and feeds
+  // both printer dropdowns; nothing else waits for it.
+  const printers = fetchPrinters();
+  const settingsThenPorts = (async () => {
+    const settingsResult = await runSection('Settings and tabs', loadSettingsAndTabs, opts);
+    const portsResult = await runSection('COM ports', async () => {
+      await refreshAllPorts();
+      return 'listed';
+    }, opts);
+    return [settingsResult, portsResult];
+  })();
+
+  const parallel = await Promise.all([
+    settingsThenPorts,
+    runSection('Printer list', async () => renderPrinterList(await printers), opts),
+    runSection('Configured printer status', async () => {
+      await checkConfiguredPrinterStatus();
+      return 'checked';
+    }, opts),
+    runSection('Temporary label settings', initTempLabelSettings, opts),
+    runSection('Temporary label source status', initTempLabelSource, opts),
+    runSection('Temporary label access key', initTempLabelKeyStatus, opts),
+    runSection('Temporary label printers', async () => renderTempLabelPrinters(await printers), opts)
+  ]);
+  results.push(...parallel.flat());
+
+  const summary = summarizeInit(results, Date.now() - started);
+  logDiagnostic(summary.level, summary.message);
+  window.comBridgeInitResults = results; // for diagnosing from DevTools / tests
+  return results;
+}
+
+window.comBridgeInitDone = init();
 
 // ---- Delivery Photos panel ----
 // A separate section (window.deliveryPhotos, from preload.js) talking to a

@@ -7,7 +7,9 @@
 //
 // No native Node dependency is used for any of this — each operation
 // shells out to Windows' own PowerShell (present on every Windows install)
-// via a small script written to a temp file and run once. This keeps the
+// via a small script, run once: printer DISCOVERY passes its script inline
+// (-EncodedCommand, see listPrinters), the printing operations write it to
+// a temp file. This keeps the
 // whole app installable/buildable with a single `npm install` on any
 // platform (no node-gyp/native-module concerns for this feature), at the
 // cost of one short-lived child process per call — entirely acceptable
@@ -29,8 +31,59 @@ const { randomUUID } = require('node:crypto');
 
 const IS_WINDOWS = process.platform === 'win32';
 const POWERSHELL_TIMEOUT_MS = 15000;
+const POWERSHELL_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass'];
 
-function runPowerShellScript(scriptContent, args = []) {
+// Windows PowerShell 5.1 sometimes reports errors on stderr as CLIXML
+// ("#< CLIXML <Objs ...><S S="Error">text_x000D__x000A_</S>...") instead of
+// plain text - turn that back into the readable lines.
+function decodeClixml(text) {
+  if (typeof text !== 'string' || !text.includes('#< CLIXML')) return text || '';
+  const lines = [...text.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map((m) => m[1]);
+  if (lines.length === 0) return text;
+  return lines
+    .join('')
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&')
+    .trim();
+}
+
+const clip = (text, max = 2000) => (text.length > max ? `${text.slice(0, max)}...` : text);
+
+// Turns a failed execFile() into an Error whose message says what actually
+// happened - timed out, exit code N, plus PowerShell's own stderr - instead
+// of Node's bare "Command failed: powershell.exe ..." (which is all anyone
+// saw before whenever stderr was empty, e.g. when the process was killed).
+// The raw facts are kept on err.diagnostics for logging.
+function describePowerShellFailure({ err, stdout, stderr, timeoutMs, command, elapsedMs }) {
+  const timedOut = Boolean(err && err.killed && (err.signal === 'SIGTERM' || err.signal === 'SIGKILL'));
+  const exitCode = err && typeof err.code === 'number' ? err.code : null;
+  const errText = decodeClixml((stderr || '').trim()).trim();
+  const outText = (stdout || '').trim();
+  let summary;
+  if (timedOut) summary = `PowerShell did not finish within ${Math.round(timeoutMs / 1000)}s and was stopped`;
+  else if (exitCode !== null) summary = `PowerShell exited with code ${exitCode}`;
+  else if (err && err.code === 'ENOENT') summary = 'powershell.exe could not be found on this PC';
+  else summary = `PowerShell could not be run${err && err.code ? ` (${err.code})` : ''}`;
+  const parts = [summary];
+  if (errText) parts.push(clip(errText));
+  else if (!timedOut) parts.push('(no error output)');
+  const error = new Error(parts.join(': '));
+  error.diagnostics = {
+    command,
+    exitCode,
+    signal: (err && err.signal) || null,
+    timedOut,
+    elapsedMs,
+    stdout: clip(outText, 1000),
+    stderr: clip(errText, 2000)
+  };
+  return error;
+}
+
+// The printing path's runner (sendRawData, getPrinterStatus): unchanged
+// apart from a clearer error message when PowerShell writes nothing to
+// stderr. A script with something on stderr is reported exactly as before.
+function runPowerShellScript(scriptContent, args = [], { timeoutMs = POWERSHELL_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const scriptPath = path.join(os.tmpdir(), `combridge-ps-${randomUUID()}.ps1`);
 
@@ -42,16 +95,23 @@ function runPowerShellScript(scriptContent, args = []) {
     }
 
     const cleanup = () => fs.unlink(scriptPath, () => {});
+    const started = Date.now();
 
     execFile(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args],
-      { timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      [...POWERSHELL_ARGS, '-File', scriptPath, ...args],
+      { timeout: timeoutMs, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
         cleanup();
         if (err) {
-          const detail = (stderr && stderr.trim()) || err.message;
-          reject(new Error(detail));
+          const described = describePowerShellFailure({
+            err, stdout, stderr, timeoutMs, elapsedMs: Date.now() - started,
+            command: `powershell.exe ${POWERSHELL_ARGS.join(' ')} -File <temporary .ps1>`
+          });
+          const plainStderr = stderr && stderr.trim();
+          const error = plainStderr ? new Error(plainStderr) : described;
+          error.diagnostics = described.diagnostics;
+          reject(error);
           return;
         }
         resolve((stdout || '').trim());
@@ -60,35 +120,166 @@ function runPowerShellScript(scriptContent, args = []) {
   });
 }
 
-const LIST_PRINTERS_SCRIPT = `
-param()
+// Runs a script passed inline with -EncodedCommand (base64 UTF-16LE, the
+// form PowerShell itself documents for this). No temporary .ps1 is written,
+// so nothing depends on %TEMP% being writable, on security software letting
+// a freshly written script in %TEMP% run, or on execution policy (which
+// governs script FILES, not -EncodedCommand).
+function runPowerShellCommand(script, { timeoutMs = POWERSHELL_TIMEOUT_MS, execFileImpl = execFile } = {}) {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const command = `powershell.exe ${POWERSHELL_ARGS.join(' ')} -EncodedCommand <inline script, ${encoded.length} chars>`;
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    execFileImpl(
+      'powershell.exe',
+      [...POWERSHELL_ARGS, '-EncodedCommand', encoded],
+      { timeout: timeoutMs, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(describePowerShellFailure({ err, stdout, stderr, timeoutMs, command, elapsedMs: Date.now() - started }));
+          return;
+        }
+        resolve((stdout || '').trim());
+      }
+    );
+  });
+}
+
+// How long Windows may take to report the optional per-printer details
+// (offline / default) before the list is returned without them, and the
+// overall limit for the whole discovery process.
+const PRINTER_DETAILS_WAIT_MS = 8000;
+const LIST_PRINTERS_TIMEOUT_MS = 30000;
+
+// Printer NAMES come from .NET's PrinterSettings.InstalledPrinters - Win32
+// EnumPrinters level 4, which Microsoft documents as the fast call that
+// reads the local printers and the user's printer connections WITHOUT
+// contacting any remote print server. The old discovery used only the WMI
+// Win32_Printer class, which asks the spooler for each printer's full
+// status, including every shared-printer connection on another PC - one
+// unreachable or half-deleted connection can stall it past the timeout, and
+// then nothing was listed at all.
+//
+// Win32_Printer is still asked, but only for the optional offline/default
+// flags, on its own runspace with a fixed wait: if it is slow or fails, the
+// names are still returned, with a warning. Any printer it knows that the
+// fast list somehow missed is added too.
+const LIST_PRINTERS_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-$printers = Get-CimInstance -ClassName Win32_Printer | Select-Object Name, Default, WorkOffline
-$printers | ConvertTo-Json -Compress
-`;
-
-// Returns { supported: false } on any non-Windows platform. On Windows,
-// { supported: true, printers: [{ name, isDefault, isOffline }, ...] }.
-async function listPrinters() {
-  if (!IS_WINDOWS) {
-    return { supported: false, printers: [] };
+$ProgressPreference = 'SilentlyContinue'
+$warnings = New-Object System.Collections.Generic.List[string]
+$names = New-Object System.Collections.Generic.List[string]
+try {
+  Add-Type -AssemblyName System.Drawing
+  foreach ($n in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) { $names.Add([string]$n) }
+} catch {
+  $warnings.Add('Printer names (InstalledPrinters): ' + $_.Exception.Message)
+}
+$details = @{}
+$detailsState = 'ok'
+try {
+  $ps = [PowerShell]::Create()
+  [void]$ps.AddScript({ Get-CimInstance -ClassName Win32_Printer -Property Name, Default, WorkOffline | Select-Object Name, Default, WorkOffline })
+  $handle = $ps.BeginInvoke()
+  if ($handle.AsyncWaitHandle.WaitOne(__DETAILS_WAIT_MS__)) {
+    foreach ($p in $ps.EndInvoke($handle)) { if ($p -and $p.Name) { $details[[string]$p.Name] = $p } }
+    if ($ps.Streams.Error.Count -gt 0) { $warnings.Add('Printer details (Win32_Printer): ' + $ps.Streams.Error[0].ToString()) }
+  } else {
+    $detailsState = 'timeout'
+    $warnings.Add('Printer details (Win32_Printer) did not answer within __DETAILS_WAIT_S__s - offline/default flags are not shown.')
   }
+} catch {
+  $detailsState = 'failed'
+  $warnings.Add('Printer details (Win32_Printer): ' + $_.Exception.Message)
+}
+foreach ($k in $details.Keys) { if (-not $names.Contains($k)) { $names.Add($k) } }
+$printers = New-Object System.Collections.Generic.List[object]
+foreach ($n in $names) {
+  $d = $details[$n]
+  $printers.Add([ordered]@{ name = $n; isDefault = [bool]($d -and $d.Default); isOffline = [bool]($d -and $d.WorkOffline) })
+}
+$result = [ordered]@{ printers = $printers.ToArray(); details = $detailsState; warnings = $warnings.ToArray() }
+# UTF-8 (no BOM), not the console's OEM code page - so a printer name with
+# accented or other non-ASCII characters reaches Node exactly as Windows has it.
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::Out.Write(($result | ConvertTo-Json -Compress -Depth 4))
+[Console]::Out.Flush()
+[Environment]::Exit(0)
+`
+  .replace(/__DETAILS_WAIT_MS__/g, String(PRINTER_DETAILS_WAIT_MS))
+  .replace(/__DETAILS_WAIT_S__/g, String(PRINTER_DETAILS_WAIT_MS / 1000));
 
-  const stdout = await runPowerShellScript(LIST_PRINTERS_SCRIPT);
-  const parsed = stdout ? JSON.parse(stdout) : [];
+// Parses the discovery script's JSON. Also accepts the old Win32_Printer
+// shape ({ Name, Default, WorkOffline }, bare object or array) so either
+// form reads the same. Names are kept exactly as Windows reports them -
+// spaces, punctuation, "\\server\share" connections and all.
+function parsePrinterList(stdout) {
+  const text = (stdout || '').replace(/^\uFEFF/, '').trim();
+  if (!text) return { printers: [], warnings: [], details: 'ok' };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`Printer discovery returned output that is not JSON: ${clip(text, 300)}`);
+  }
+  const isEnvelope = parsed && !Array.isArray(parsed) && typeof parsed === 'object' && 'printers' in parsed;
+  const raw = isEnvelope ? parsed.printers : parsed;
   // ConvertTo-Json returns a bare object (not a 1-element array) when
   // there's exactly one result — normalize that here so callers never see
   // the difference.
-  const list = Array.isArray(parsed) ? parsed : [parsed];
+  const list = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
+  const seen = new Set();
+  const printers = [];
+  for (const p of list) {
+    if (!p || typeof p !== 'object') continue;
+    const name = typeof p.name === 'string' ? p.name : typeof p.Name === 'string' ? p.Name : '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    printers.push({ name, isDefault: !!(p.isDefault ?? p.Default), isOffline: !!(p.isOffline ?? p.WorkOffline) });
+  }
+  const warnings = isEnvelope && parsed.warnings != null ? [].concat(parsed.warnings).map(String) : [];
+  return { printers, warnings, details: isEnvelope && parsed.details ? String(parsed.details) : 'ok' };
+}
 
-  return {
-    supported: true,
-    printers: list.filter(Boolean).map((p) => ({
-      name: p.Name,
-      isDefault: !!p.Default,
-      isOffline: !!p.WorkOffline
-    }))
-  };
+// Returns { supported: false } on any non-Windows platform. On Windows,
+// { supported: true, printers: [{ name, isDefault, isOffline }, ...],
+//   warnings: [...], details: 'ok'|'timeout'|'failed', method, elapsedMs }.
+// Rejects (with err.diagnostics) only when no printer list could be read.
+//
+// The inline (-EncodedCommand) run is tried first. If it fails for any
+// reason other than a timeout (e.g. security software that blocks encoded
+// commands), the same script is tried once more the old way, from a
+// temporary .ps1 file. A timeout is not retried - the second try would only
+// double the wait.
+//
+// `deps` is for tests only.
+async function listPrinters(deps = {}) {
+  const platform = deps.platform || process.platform;
+  if (platform !== 'win32') {
+    return { supported: false, printers: [] };
+  }
+  const runInline = deps.runInline || ((script) => runPowerShellCommand(script, { timeoutMs: LIST_PRINTERS_TIMEOUT_MS }));
+  const runFile = deps.runFile || ((script) => runPowerShellScript(script, [], { timeoutMs: LIST_PRINTERS_TIMEOUT_MS }));
+  const started = Date.now();
+
+  let stdout;
+  let method = 'inline';
+  try {
+    stdout = await runInline(LIST_PRINTERS_SCRIPT);
+  } catch (inlineErr) {
+    if (inlineErr.diagnostics && inlineErr.diagnostics.timedOut) throw inlineErr;
+    method = 'temp-file';
+    try {
+      stdout = await runFile(LIST_PRINTERS_SCRIPT);
+    } catch (fileErr) {
+      const error = new Error(`${inlineErr.message} | Retried from a temporary .ps1 file: ${fileErr.message}`);
+      error.diagnostics = { inline: inlineErr.diagnostics || null, tempFile: fileErr.diagnostics || null };
+      throw error;
+    }
+  }
+
+  const parsed = parsePrinterList(stdout);
+  return { supported: true, ...parsed, method, elapsedMs: Date.now() - started };
 }
 
 const GET_STATUS_SCRIPT = `
@@ -268,4 +459,17 @@ async function sendRawData(printerName, dataBuffer, options = {}) {
   }
 }
 
-module.exports = { listPrinters, getPrinterStatus, sendRawData, cleanDocName, DEFAULT_DOC_NAME };
+module.exports = {
+  listPrinters,
+  getPrinterStatus,
+  sendRawData,
+  cleanDocName,
+  DEFAULT_DOC_NAME,
+  // Exposed for tests and diagnostics.
+  parsePrinterList,
+  describePowerShellFailure,
+  decodeClixml,
+  runPowerShellCommand,
+  LIST_PRINTERS_SCRIPT,
+  LIST_PRINTERS_TIMEOUT_MS
+};
