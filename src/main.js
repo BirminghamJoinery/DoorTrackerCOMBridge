@@ -104,7 +104,10 @@ function sendToRenderer(channel, payload) {
 }
 
 // Exactly the configured printer, or nothing - see createPrinterCheck().
-const checkTempLabelPrinter = createPrinterCheck((name) => windowsPrinter.getPrinterStatus(name));
+// Uses the bounded check (checkPrinterForPrinting), not getPrinterStatus:
+// a printer whose detailed Windows status is slow to answer is still printed
+// to, instead of the whole print waiting out the 15s PowerShell limit.
+const checkTempLabelPrinter = createPrinterCheck((name) => windowsPrinter.checkPrinterForPrinting(name));
 
 const tempLabelSource = createTempLabelSource({
   cachePath: TEMP_LABELS_CACHE_PATH(),

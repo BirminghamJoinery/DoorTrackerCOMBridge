@@ -7,8 +7,9 @@
 //
 // No native Node dependency is used for any of this — each operation
 // shells out to Windows' own PowerShell (present on every Windows install)
-// via a small script, run once: printer DISCOVERY passes its script inline
-// (-EncodedCommand, see listPrinters), the printing operations write it to
+// via a small script, run once: printer DISCOVERY and the temporary-label
+// printer check pass their script inline (-EncodedCommand, see listPrinters
+// and checkPrinterForPrinting), getPrinterStatus and sendRawData write it to
 // a temp file. This keeps the
 // whole app installable/buildable with a single `npm install` on any
 // platform (no node-gyp/native-module concerns for this feature), at the
@@ -317,6 +318,142 @@ async function getPrinterStatus(printerName) {
   return { supported: true, found: !!parsed.found, offline: !!parsed.isOffline, statusOffline };
 }
 
+// ---- Bounded printer check for Temporary Data Matrix Printing ----
+//
+// getPrinterStatus() above runs one unbounded WMI query
+// (Win32_Printer -Filter "Name='...'") under the 15s PowerShell limit. WMI
+// builds a Win32_Printer instance by asking the spooler - and the printer's
+// own driver - for its full state; a driver or port that is slow to answer
+// (a bidirectional status request the printer does not reply to, for
+// example) holds that query until PowerShell is killed, even though Windows
+// can still print to the queue. It also cannot find a "\\server\share" name
+// (the backslashes are not escaped for WQL - "Invalid query").
+//
+// This check separates the two questions:
+//   1. Does a printer with EXACTLY this name exist? - PrinterSettings.
+//      InstalledPrinters (EnumPrinters level 4: the spooler's own list, no
+//      driver and no remote server involved), the same fast source as
+//      printer discovery.
+//   2. Is it offline? - Win32_Printer for that ONE printer (a key lookup,
+//      not a query over every printer), on its own runspace with a fixed
+//      wait. If it does not answer in time, the result says so
+//      (details: 'timeout') instead of the whole check failing.
+// The name is passed base64-encoded and decoded inside the script, so no
+// printer name can change the script's meaning.
+const PRINTER_CHECK_DETAILS_WAIT_MS = 4000;
+const PRINTER_CHECK_TIMEOUT_MS = 12000;
+
+const PRINTER_CHECK_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__NAME_B64__'))
+$warnings = New-Object System.Collections.Generic.List[string]
+$found = $false
+$foundBy = $null
+try {
+  Add-Type -AssemblyName System.Drawing
+  foreach ($n in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) {
+    if ([string]$n -eq $name) { $found = $true; $foundBy = 'InstalledPrinters'; break }
+  }
+} catch {
+  $warnings.Add('Printer names (InstalledPrinters): ' + $_.Exception.Message)
+}
+$namesMs = $sw.ElapsedMilliseconds
+$details = 'ok'
+$p = $null
+try {
+  $ps = [PowerShell]::Create()
+  [void]$ps.AddScript({
+    param($n)
+    $key = New-CimInstance -ClassName Win32_Printer -Property @{ DeviceID = $n } -Key DeviceID -ClientOnly
+    Get-CimInstance -InputObject $key -ErrorAction Stop | Select-Object WorkOffline, PrinterStatus, ExtendedPrinterStatus
+  }).AddArgument($name)
+  $handle = $ps.BeginInvoke()
+  if ($handle.AsyncWaitHandle.WaitOne(__DETAILS_WAIT_MS__)) {
+    try {
+      $p = @($ps.EndInvoke($handle)) | Select-Object -First 1
+    } catch {
+      $inner = $_.Exception
+      while ($inner.InnerException) { $inner = $inner.InnerException }
+      if ($inner.Message -match 'Not found') { $details = 'not-found' }
+      else { $details = 'failed'; $warnings.Add('Printer status (Win32_Printer): ' + $inner.Message) }
+    }
+    if ($details -eq 'ok' -and $null -eq $p) { $details = 'not-found' }
+  } else {
+    $details = 'timeout'
+    $warnings.Add('Printer status (Win32_Printer) did not answer within __DETAILS_WAIT_S__s.')
+  }
+} catch {
+  $details = 'failed'
+  $warnings.Add('Printer status (Win32_Printer): ' + $_.Exception.Message)
+}
+if (-not $found -and $null -ne $p) { $found = $true; $foundBy = 'Win32_Printer' }
+$result = [ordered]@{
+  found = $found
+  foundBy = $foundBy
+  details = $details
+  isOffline = [bool]($p -and $p.WorkOffline)
+  printerStatus = $(if ($p) { [int]$p.PrinterStatus } else { $null })
+  extendedStatus = $(if ($p) { [int]$p.ExtendedPrinterStatus } else { $null })
+  namesMs = $namesMs
+  detailsMs = $sw.ElapsedMilliseconds - $namesMs
+  warnings = $warnings.ToArray()
+}
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::Out.Write(($result | ConvertTo-Json -Compress -Depth 3))
+[Console]::Out.Flush()
+[Environment]::Exit(0)
+`
+  .replace(/__DETAILS_WAIT_MS__/g, String(PRINTER_CHECK_DETAILS_WAIT_MS))
+  .replace(/__DETAILS_WAIT_S__/g, String(PRINTER_CHECK_DETAILS_WAIT_MS / 1000));
+
+function buildPrinterCheckScript(printerName) {
+  return PRINTER_CHECK_SCRIPT.replace('__NAME_B64__', Buffer.from(String(printerName), 'utf8').toString('base64'));
+}
+
+// Returns { supported: false, ... } off-Windows. On Windows:
+//   { supported: true, found, foundBy, details: 'ok'|'not-found'|'timeout'|'failed',
+//     offline, statusOffline, printerStatus, extendedStatus, warnings,
+//     namesMs, detailsMs, elapsedMs }
+// `offline`/`statusOffline` mean the same as in getPrinterStatus(), and are
+// only meaningful when details === 'ok'. Rejects (with err.diagnostics) only
+// when PowerShell itself fails or exceeds PRINTER_CHECK_TIMEOUT_MS.
+// `deps` is for tests only.
+async function checkPrinterForPrinting(printerName, deps = {}) {
+  const platform = deps.platform || process.platform;
+  if (platform !== 'win32') {
+    return { supported: false, found: false, offline: false, statusOffline: false, details: 'failed', warnings: [] };
+  }
+  if (!printerName) {
+    return { supported: true, found: false, offline: false, statusOffline: false, details: 'not-found', warnings: [] };
+  }
+  const run = deps.run || ((script) => runPowerShellCommand(script, { timeoutMs: PRINTER_CHECK_TIMEOUT_MS }));
+  const started = Date.now();
+  const stdout = await run(buildPrinterCheckScript(printerName));
+  let parsed;
+  try {
+    parsed = JSON.parse((stdout || '').replace(/^\uFEFF/, '').trim());
+  } catch {
+    throw new Error(`Printer check returned output that is not JSON: ${clip(String(stdout || ''), 300)}`);
+  }
+  const details = ['ok', 'not-found', 'timeout', 'failed'].includes(parsed.details) ? parsed.details : 'failed';
+  return {
+    supported: true,
+    found: !!parsed.found,
+    foundBy: parsed.foundBy || null,
+    details,
+    offline: details === 'ok' && !!parsed.isOffline,
+    statusOffline: details === 'ok' && (parsed.printerStatus === 7 || parsed.extendedStatus === 7),
+    printerStatus: parsed.printerStatus ?? null,
+    extendedStatus: parsed.extendedStatus ?? null,
+    warnings: parsed.warnings == null ? [] : [].concat(parsed.warnings).map(String),
+    namesMs: parsed.namesMs ?? null,
+    detailsMs: parsed.detailsMs ?? null,
+    elapsedMs: Date.now() - started
+  };
+}
+
 // Canonical Win32 "send raw bytes to a printer queue" pattern (OpenPrinter/
 // StartDocPrinter/StartPagePrinter/WritePrinter/EndPagePrinter/EndDocPrinter
 // with datatype "RAW") — this is the long-established technique real
@@ -330,6 +467,12 @@ param(
   [string]$DocName = 'Door Tracker Delivery Label'
 )
 $ErrorActionPreference = 'Stop'
+# Progress lines ("STAGE <step> <ms since powershell.exe started>ms") are
+# flushed as each step finishes, so if this is ever stopped part-way the
+# output captured so far shows the last step that completed.
+$launchedAt = [System.Diagnostics.Process]::GetCurrentProcess().StartTime
+[Console]::Out.WriteLine('STAGE powershell-ready ' + [long]((Get-Date) - $launchedAt).TotalMilliseconds + 'ms')
+[Console]::Out.Flush()
 
 Add-Type -TypeDefinition @'
 using System;
@@ -366,6 +509,13 @@ public class RawPrinterHelper
     [DllImport("winspool.drv", EntryPoint = "WritePrinter", SetLastError = true, ExactSpelling = true, CallingConvention = CallingConvention.StdCall)]
     public static extern bool WritePrinter(IntPtr hPrinter, IntPtr pBytes, Int32 dwCount, out Int32 dwWritten);
 
+    public static void Mark(string stage)
+    {
+        double ms = (DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime).TotalMilliseconds;
+        Console.Out.WriteLine("STAGE " + stage + " " + ((long)ms).ToString() + "ms");
+        Console.Out.Flush();
+    }
+
     public static void SendBytesToPrinter(string printerName, byte[] bytes, string docName)
     {
         IntPtr hPrinter;
@@ -378,12 +528,14 @@ public class RawPrinterHelper
         {
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "OpenPrinter failed");
         }
+        Mark("open-printer");
         try
         {
             if (!StartDocPrinter(hPrinter, 1, di))
             {
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "StartDocPrinter failed");
             }
+            Mark("start-doc");
             try
             {
                 if (!StartPagePrinter(hPrinter))
@@ -400,6 +552,7 @@ public class RawPrinterHelper
                     {
                         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WritePrinter failed or wrote a short buffer");
                     }
+                    Mark("write-printer " + written.ToString() + "-bytes");
                 }
                 finally
                 {
@@ -410,6 +563,7 @@ public class RawPrinterHelper
             finally
             {
                 EndDocPrinter(hPrinter);
+                Mark("end-doc");
             }
         }
         finally
@@ -420,6 +574,7 @@ public class RawPrinterHelper
 }
 '@
 
+[RawPrinterHelper]::Mark('compiled')
 $bytes = [System.IO.File]::ReadAllBytes($FilePath)
 [RawPrinterHelper]::SendBytesToPrinter($PrinterName, $bytes, $DocName)
 Write-Output "OK"
@@ -444,6 +599,21 @@ function cleanDocName(docName) {
 // Resolves once Windows has accepted the submission (WritePrinter
 // succeeded) — see printer-service.js for exactly what that does and does
 // not prove about physical output.
+//
+// Resolves with { elapsedMs, stages } - stages are the script's progress
+// lines ("powershell-ready 650ms", "compiled 900ms", "open-printer ...",
+// "start-doc ...", "write-printer 312-bytes ...", "end-doc ...", times since
+// powershell.exe started). Existing callers ignore the value. On failure the
+// same lines are on err.diagnostics.stages, so a timeout shows the last step
+// that finished.
+function parseSendStages(stdout) {
+  return String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('STAGE '))
+    .map((line) => line.slice(6));
+}
+
 async function sendRawData(printerName, dataBuffer, options = {}) {
   if (!IS_WINDOWS) {
     throw new Error('Raw printer submission is only implemented on Windows.');
@@ -452,8 +622,13 @@ async function sendRawData(printerName, dataBuffer, options = {}) {
   const tempDataPath = path.join(os.tmpdir(), `combridge-print-${randomUUID()}.zpl`);
   fs.writeFileSync(tempDataPath, dataBuffer);
 
+  const started = Date.now();
   try {
-    await runPowerShellScript(SEND_RAW_SCRIPT, ['-PrinterName', printerName, '-FilePath', tempDataPath, '-DocName', cleanDocName(options && options.docName)]);
+    const stdout = await runPowerShellScript(SEND_RAW_SCRIPT, ['-PrinterName', printerName, '-FilePath', tempDataPath, '-DocName', cleanDocName(options && options.docName)]);
+    return { elapsedMs: Date.now() - started, stages: parseSendStages(stdout) };
+  } catch (err) {
+    if (err && err.diagnostics) err.diagnostics.stages = parseSendStages(err.diagnostics.stdout);
+    throw err;
   } finally {
     fs.unlink(tempDataPath, () => {});
   }
@@ -462,11 +637,16 @@ async function sendRawData(printerName, dataBuffer, options = {}) {
 module.exports = {
   listPrinters,
   getPrinterStatus,
+  checkPrinterForPrinting,
   sendRawData,
   cleanDocName,
   DEFAULT_DOC_NAME,
   // Exposed for tests and diagnostics.
   parsePrinterList,
+  parseSendStages,
+  buildPrinterCheckScript,
+  PRINTER_CHECK_DETAILS_WAIT_MS,
+  PRINTER_CHECK_TIMEOUT_MS,
   describePowerShellFailure,
   decodeClixml,
   runPowerShellCommand,

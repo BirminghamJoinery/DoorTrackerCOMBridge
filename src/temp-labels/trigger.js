@@ -41,20 +41,102 @@ function createSerialQueue() {
   return { run, get pending() { return pending; } };
 }
 
-// Builds the printer check from windows-printer.js's getPrinterStatus:
-// exactly the named printer, or a reason it cannot be used. Never the main
-// printer, never the Windows default. Also refuses when Windows itself
-// reports the printer Offline (statusOffline - an unplugged/switched-off USB
-// printer), so a batch is not left in the Windows queue to print
-// unexpectedly later.
-function createPrinterCheck(getPrinterStatus, platform = process.platform) {
+// How long the printer check may take before the print goes ahead without
+// it (see createPrinterCheck). windows-printer.js's own check limits itself
+// to well under this; this is the backstop.
+const DEFAULT_PRINTER_CHECK_TIMEOUT_MS = 10 * 1000;
+
+function errorText(err) {
+  return (err && err.message) || String(err);
+}
+
+// PowerShell's own facts about a failed run (windows-printer.js puts them on
+// err.diagnostics): whether it was stopped by the time limit, exit code,
+// elapsed time, the last steps it reported and its error output. Printer
+// names and temp-file paths only - nothing secret passes through here.
+function describeDiagnostics(d) {
+  if (!d || typeof d !== 'object') return '';
+  const parts = [];
+  if (d.command) parts.push(`command: ${d.command}`);
+  if (d.timedOut) parts.push('stopped by the time limit');
+  if (d.exitCode != null) parts.push(`exit code ${d.exitCode}`);
+  if (d.elapsedMs != null) parts.push(`PowerShell ran ${d.elapsedMs}ms`);
+  if (Array.isArray(d.stages)) parts.push(d.stages.length ? `last steps reached: ${d.stages.join(', ')}` : 'no steps reached');
+  if (d.stderr) parts.push(`stderr: ${String(d.stderr).slice(0, 500)}`);
+  return parts.length ? ` [${parts.join('; ')}]` : '';
+}
+
+// What the printer check found, for the step-1 log line.
+function describeCheck(result) {
+  if (!result) return '';
+  const s = result.status;
+  const parts = [];
+  if (s && s.foundBy) parts.push(`found via ${s.foundBy}`);
+  if (s && s.details) parts.push(`status ${s.details}`);
+  if (s && s.printerStatus != null) parts.push(`PrinterStatus ${s.printerStatus}/ExtendedPrinterStatus ${s.extendedStatus}`);
+  if (s && s.namesMs != null) parts.push(`names ${s.namesMs}ms, status ${s.detailsMs}ms, PowerShell total ${s.elapsedMs}ms`);
+  const diag = describeDiagnostics(result.error && result.error.diagnostics);
+  return (parts.length ? ` (${parts.join(', ')})` : '') + diag;
+}
+
+// Builds the printer check from windows-printer.js's checkPrinterForPrinting
+// (or anything returning the same shape - getPrinterStatus's older shape,
+// with no `details`, reads as fully checked): exactly the named printer, or
+// a reason it cannot be used. Never the main printer, never the Windows
+// default.
+//
+// Refuses when:
+//   - the printer is not found on this PC, or
+//   - Windows' status was read and reports it Offline (WorkOffline, or
+//     PrinterStatus/ExtendedPrinterStatus 7 - an unplugged/switched-off USB
+//     printer), so a batch is not left in the Windows queue to print
+//     unexpectedly later.
+// Goes ahead, with a `warning`, when the printer exists but its detailed
+// status could not be read (details 'timeout' or 'failed'), or when the
+// check itself failed or took longer than `timeoutMs` - a slow status query
+// must never stop a print to a known printer. Sending can still never reach
+// a different printer: the raw submission opens exactly this name and
+// Windows refuses it if no such printer exists.
+//
+// Resolves { ok, reason?, warning?, status?, error?, ms }; never rejects.
+function createPrinterCheck(getStatus, platform = process.platform, { timeoutMs = DEFAULT_PRINTER_CHECK_TIMEOUT_MS, now = () => Date.now() } = {}) {
   return async function checkPrinter(printerName) {
-    if (!printerName) return { ok: false, reason: 'No printer is configured for this station' };
-    const status = await getPrinterStatus(printerName);
-    if (!status || !status.supported) return { ok: false, reason: `Printer unavailable - printing is only implemented on Windows (this is ${platform})` };
-    if (!status.found) return { ok: false, reason: `Printer unavailable - "${printerName}" was not found on this PC` };
-    if (status.offline || status.statusOffline) return { ok: false, reason: `Printer unavailable - Windows reports "${printerName}" as offline (is it switched on and connected by USB?)` };
-    return { ok: true };
+    const started = now();
+    const done = (result) => ({ ...result, ms: now() - started });
+    if (!printerName) return done({ ok: false, reason: 'No printer is configured for this station' });
+
+    let timer;
+    let status;
+    try {
+      status = await Promise.race([
+        Promise.resolve().then(() => getStatus(printerName)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`the printer check did not finish within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+          if (timer.unref) timer.unref();
+        })
+      ]);
+    } catch (err) {
+      return done({
+        ok: true,
+        warning: `Printer status could not be checked (${errorText(err)}) - sending anyway; Windows refuses the job if "${printerName}" does not exist`,
+        error: err
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!status || !status.supported) return done({ ok: false, reason: `Printer unavailable - printing is only implemented on Windows (this is ${platform})`, status });
+    if (!status.found) return done({ ok: false, reason: `Printer unavailable - "${printerName}" was not found on this PC`, status });
+    const details = status.details || 'ok';
+    if (details === 'ok') {
+      if (status.offline || status.statusOffline) {
+        const raw = status.printerStatus != null ? ` (PrinterStatus ${status.printerStatus}, ExtendedPrinterStatus ${status.extendedStatus}, WorkOffline ${status.offline ? 'on' : 'off'})` : '';
+        return done({ ok: false, reason: `Printer unavailable - Windows reports "${printerName}" as offline${raw} (is it switched on and connected by USB?)`, status });
+      }
+      return done({ ok: true, status });
+    }
+    const why = (status.warnings && status.warnings.length ? status.warnings.join(' ') : details);
+    return done({ ok: true, status, warning: `"${printerName}" exists but its status could not be read (${why}) - sending anyway` });
   };
 }
 
@@ -125,27 +207,55 @@ function createTempLabelTrigger(deps) {
 
   // Printer check, render and raw submission for one batch - always inside
   // the serial queue, so the printer status is checked right before sending.
+  // Each stage is logged as it starts and ends, with its elapsed time, so a
+  // log shows exactly which stage a print stopped in.
   async function submit(printerName, codes, docName) {
+    const stage = `Temporary label print "${docName}" on "${printerName}"`;
+    const began = now();
+
+    logger.info(`${stage} - step 1/3 printer check started.`);
     let printer;
     try {
       printer = await checkPrinter(printerName);
     } catch (err) {
-      printer = { ok: false, reason: (err && err.message) || String(err) };
+      printer = { ok: false, reason: errorText(err), error: err };
     }
-    if (!printer || !printer.ok) return { ok: false, reason: (printer && printer.reason) || 'Printer unavailable' };
+    const checkMs = printer && typeof printer.ms === 'number' ? printer.ms : now() - began;
+    if (!printer || !printer.ok) {
+      const reason = (printer && printer.reason) || 'Printer unavailable';
+      logger.warn(`${stage} - step 1/3 printer check refused after ${checkMs}ms: ${reason}${describeCheck(printer)}`);
+      return { ok: false, reason };
+    }
+    if (printer.warning) {
+      logger.warn(`${stage} - step 1/3 printer check incomplete after ${checkMs}ms: ${printer.warning}${describeCheck(printer)}`);
+    } else {
+      logger.info(`${stage} - step 1/3 printer check passed in ${checkMs}ms${describeCheck(printer)}.`);
+    }
 
+    const renderStarted = now();
     let zpl;
     try {
       zpl = render(codes, getLayout());
     } catch (err) {
-      return { ok: false, reason: `Label generation failed: ${(err && err.message) || err}` };
+      const reason = `Label generation failed: ${errorText(err)}`;
+      logger.warn(`${stage} - step 2/3 ${reason}`);
+      return { ok: false, reason };
     }
+    const bytes = Buffer.from(zpl, 'ascii');
+    logger.info(`${stage} - step 2/3 ZPL generated in ${now() - renderStarted}ms (${codes.length} label(s), ${bytes.length} bytes).`);
 
+    const sendStarted = now();
+    logger.info(`${stage} - step 3/3 raw submission started.`);
+    let sent;
     try {
-      await sendRaw(printerName, Buffer.from(zpl, 'ascii'), { docName });
+      sent = await sendRaw(printerName, bytes, { docName });
     } catch (err) {
-      return { ok: false, reason: `Print submission to "${printerName}" failed: ${(err && err.message) || err}` };
+      const reason = `Print submission to "${printerName}" failed: ${errorText(err)}`;
+      logger.warn(`${stage} - step 3/3 raw submission failed after ${now() - sendStarted}ms: ${errorText(err)}${describeDiagnostics(err && err.diagnostics)}`);
+      return { ok: false, reason };
     }
+    const steps = sent && Array.isArray(sent.stages) && sent.stages.length ? ` (inside PowerShell: ${sent.stages.join(', ')})` : '';
+    logger.info(`${stage} - step 3/3 raw submission accepted by Windows in ${now() - sendStarted}ms${steps}. Total ${now() - began}ms.`);
     return { ok: true };
   }
 
