@@ -47,6 +47,11 @@ function encodedCodes(zplText) {
   return [...zplText.matchAll(/\^BX[^]*?\^FD([^^]*)\^FS/g)].map((m) => m[1]);
 }
 
+// The printed text fields (^A0 ... ^FD<text>^FS), in print order.
+function textFields(zplText) {
+  return [...zplText.matchAll(/\^A0[^\n]*?\^FD([^^]*)\^FS/g)].map((m) => m[1]);
+}
+
 const STATION_NAMES = { joint_prehung: 'Pre-Hung', door_machining: 'Door CNC', joint_assembly: 'Assembly' };
 
 // A trigger wired to a real settings file, an in-memory source and fake printers.
@@ -611,28 +616,98 @@ test('after the suppression window the same order prints again - there is no per
 
 // ---------------------------------------------------------------- the label (ZPL)
 
-test('each label is ONE native Data Matrix (^BX, ECC200) encoding exactly the code - nothing else', () => {
+test('each label is ONE native Data Matrix (^BX, ECC200) encoding exactly the full code, with the same full code as text above it', () => {
   const label = zpl.buildTempLabelZpl('5698-T-01', settings.DEFAULT_LAYOUT);
   assert.equal((label.match(/\^XA/g) || []).length, 1);
   assert.equal((label.match(/\^BX/g) || []).length, 1);
-  assert.equal((label.match(/\^FD/g) || []).length, 1, 'no text fields');
-  assert.doesNotMatch(label, /\^GF|\^A0|\^B[^X]/, 'no bitmap, text or other barcode');
-  assert.match(label, /\^BXN,8,200,14,14\^FD5698-T-01\^FS/);
+  assert.equal((label.match(/\^FD/g) || []).length, 2, 'the symbol and one text field');
+  assert.doesNotMatch(label, /\^GF|\^B[^X]/, 'no bitmap or other barcode');
+  assert.match(label, /\^BXN,8,200,16,16\^FD5698-T-01\^FS/, 'the symbol encodes the full code');
   assert.deepEqual(encodedCodes(label), ['5698-T-01']);
+  assert.deepEqual(textFields(label), ['5698-T-01']);
+  assert.doesNotMatch(label, /\^FDT-1\^FS/, 'no short T-n text any more');
+  // The exact label, at the default 89x36mm/203dpi layout.
+  assert.equal(label, [
+    '^XA', '^MTD', '^PW711', '^LL288', '^LH0,0', '^LS-24', '^LT24',
+    '^FO0,56^A0N,32,32^FB711,1,0,C,0^FD5698-T-01^FS',
+    '^FO291,104^BXN,8,200,16,16^FD5698-T-01^FS',
+    '^XZ', ''
+  ].join('\n'));
 });
 
-test('the Data Matrix is centred on the label with a quiet zone of at least 2 modules', () => {
+test('the visible text is the full code of each label, identical to what its Data Matrix encodes', () => {
+  for (const [order, qty] of [['5698', 12], ['5626-2', 3], ['5626-123', 2]]) {
+    const generated = codes.generateTempCodes(order, qty);
+    const batch = zpl.buildTempBatchZpl(generated, settings.DEFAULT_LAYOUT);
+    assert.deepEqual(textFields(batch), generated, `${order}: text is ${generated[0]} ... ${generated[generated.length - 1]}`);
+    assert.deepEqual(encodedCodes(batch), generated, `${order}: every symbol still encodes the same full code`);
+  }
+  for (const code of ['5626-2-T-01', '5626-12-T-09', '5626-123-T-100', '5698-T-200', 'TEST-T-01', 'ABC123']) {
+    assert.equal(zpl.labelTextFor(code), code);
+    const label = zpl.buildTempLabelZpl(code, settings.DEFAULT_LAYOUT);
+    assert.deepEqual(textFields(label), [code], code);
+    assert.deepEqual(encodedCodes(label), [code], code);
+  }
+});
+
+test('the full code fits across the label at 4mm, call-off codes included; only a long typed code is set smaller', () => {
+  const layout = settings.DEFAULT_LAYOUT; // 711 dots wide
+  const usable = 711 - 2 * 16; // 2mm side margins
+  for (const code of ['5698-T-01', '5626-2-T-01', '5626-12-T-99', '5626-123-T-200']) {
+    const box = zpl.layoutTempLabel(code, layout);
+    assert.equal(box.textDots, 32, `${code} at the full 4mm`);
+    const widest = code.length * zpl.TEXT_CHAR_WIDTH_RATIO * box.textDots;
+    assert.ok(widest <= usable, `${code}: at most ${Math.round(widest)} of ${usable} dots`);
+    assert.match(zpl.buildTempLabelZpl(code, layout), new RegExp(`\\^FO0,${box.textY}\\^A0N,32,32\\^FB711,1,0,C,0\\^FD${code}\\^FS`), `${code} centred in one ^FB line`);
+  }
+  // 5626-2-T-01 sits exactly where 5698-T-01 does: same symbol size, same block.
+  const short = zpl.layoutTempLabel('5698-T-01', layout);
+  const callOff = zpl.layoutTempLabel('5626-2-T-01', layout);
+  assert.deepEqual([callOff.textY, callOff.x, callOff.y, callOff.modules], [short.textY, short.x, short.y, short.modules]);
+  // The longest typed test code still fits on one line, set smaller.
+  const long = zpl.layoutTempLabel('A'.repeat(40), layout);
+  assert.ok(long.textDots < 32 && long.textDots >= 16, `40 characters at ${long.textDots} dots`);
+  assert.ok(40 * zpl.TEXT_CHAR_WIDTH_RATIO * long.textDots <= usable);
+  assert.equal(zpl.labelTextDots('5698-T-01', 711, 203), 32);
+  assert.equal(zpl.labelTextDots('A'.repeat(40), 100, 203), null, 'too narrow for readable text');
+});
+
+test('the Data Matrix is printed 2mm larger than before, with the same 1mm modules', () => {
+  const layout = settings.DEFAULT_LAYOUT;
+  const mm = (dots) => (dots * 25.4) / layout.dpi;
+  for (const code of ['5698-T-01', '5626-2-T-01', '5626-12-T-100', 'TEST-T-01']) {
+    const box = zpl.layoutTempLabel(code, layout);
+    const before = box.minModules * layout.moduleDots; // the old layout: smallest symbol, same module
+    assert.equal(box.moduleDots, 8, `${code} module size unchanged`);
+    assert.equal(box.grown, true);
+    assert.equal(box.symbolDots - before, 16, `${code}: +16 dots`);
+    assert.ok(Math.abs(mm(box.symbolDots) - mm(before) - 2) < 0.01, `${code}: +2mm (${mm(before).toFixed(2)} -> ${mm(box.symbolDots).toFixed(2)}mm)`);
+  }
+  assert.equal(zpl.layoutTempLabel('5698-T-01', layout).symbolDots, 128, '5698-T-01: 14.0mm -> 16.0mm');
+  assert.equal(zpl.SYMBOL_GROWTH_MM, 2);
+  assert.equal(zpl.grownModulesFor(14, 8, 203), 16);
+  assert.equal(zpl.grownModulesFor(16, 8, 203), 18);
+  assert.equal(zpl.grownModulesFor(44, 8, 203), null, 'no larger square size exists');
+});
+
+test('text and Data Matrix are centred as one block, the text above with a quiet zone of clear space - no overlap', () => {
   const layout = { ...settings.DEFAULT_LAYOUT }; // 89x36mm at 203dpi = 711x288 dots (287.7 rounded)
-  for (const code of ['5698-T-01', '5626-12-T-100', 'TEST-T-01']) {
+  for (const code of ['5698-T-01', '5626-2-T-01', '5626-12-T-100', 'TEST-T-01']) {
     const box = zpl.layoutTempLabel(code, layout);
     assert.equal(box.widthDots, 711);
     assert.equal(box.heightDots, 288);
     const right = box.widthDots - (box.x + box.symbolDots);
     const bottom = box.heightDots - (box.y + box.symbolDots);
     assert.ok(Math.abs(box.x - right) <= 1, `${code} horizontally centred`);
-    assert.ok(Math.abs(box.y - bottom) <= 1, `${code} vertically centred`);
+    assert.ok(Math.abs(box.textY - bottom) <= 1, `${code} text + symbol vertically centred`);
+    const textBottom = box.textY + box.textDots;
+    assert.ok(textBottom <= box.y - 2 * box.moduleDots, `${code} text ends a full quiet zone above the symbol`);
+    assert.ok(box.textY >= 2 * box.moduleDots, `${code} text margin from the top edge`);
     assert.ok(box.quietZoneDots >= 2 * box.moduleDots, `${code} quiet zone`);
-    assert.match(zpl.buildTempLabelZpl(code, layout), new RegExp(`\\^FO${box.x},${box.y}\\^BXN,${box.moduleDots},200,${box.modules},${box.modules}`));
+    assert.equal(box.textDots, 32, '4mm text');
+    const label = zpl.buildTempLabelZpl(code, layout);
+    assert.equal(box.text, code);
+    assert.match(label, new RegExp(`\\^FO0,${box.textY}\\^A0N,32,32\\^FB711,1,0,C,0\\^FD${code}\\^FS\\n\\^FO${box.x},${box.y}\\^BXN,${box.moduleDots},200,${box.modules},${box.modules}\\^FD${code}\\^FS`));
   }
   // calibration offsets come from the GK420D's measured shift and are applied once, at format level
   assert.match(zpl.buildTempLabelZpl('5698-T-01', layout), /\^PW711\n\^LL288\n\^LH0,0\n\^LS-24\n\^LT24\n/);
@@ -647,9 +722,20 @@ test('the symbol is always big enough for the code; small labels get smaller mod
     const capacity = zpl.ECC200_SQUARE_SIZES.find(([size]) => size === modules)[1];
     assert.ok(capacity >= zpl.asciiCodewordCount(code), code);
   }
-  const small = zpl.layoutTempLabel('5698-T-01', { ...settings.DEFAULT_LAYOUT, widthMm: 25, heightMm: 15 });
-  assert.ok(small.moduleDots < 8 && small.moduleDots >= zpl.MIN_MODULE_DOTS);
-  assert.ok(small.quietZoneDots >= 2 * small.moduleDots);
+  for (const code of ['5698-T-01', '5626-2-T-01']) {
+    const small = zpl.layoutTempLabel(code, { ...settings.DEFAULT_LAYOUT, widthMm: 25, heightMm: 15 });
+    assert.ok(small.moduleDots < 8 && small.moduleDots >= zpl.MIN_MODULE_DOTS, code);
+    assert.ok(small.quietZoneDots >= 2 * small.moduleDots, code);
+    assert.ok(small.textY + small.textDots <= small.y - 2 * small.moduleDots, `${code} text still clear of the symbol`);
+    assert.ok(small.y + small.symbolDots + 2 * small.moduleDots <= small.heightDots, `${code} fits the label`);
+    assert.ok(code.length * zpl.TEXT_CHAR_WIDTH_RATIO * small.textDots <= small.widthDots - 2 * 16, `${code} text fits across`);
+  }
+  // Bigger modules come before the 2mm growth: a label with room for the
+  // minimum symbol at 8 dots but not the grown one keeps 8-dot modules.
+  const tight = zpl.layoutTempLabel('5698-T-01', { ...settings.DEFAULT_LAYOUT, heightMm: 24 }); // 192 dots
+  assert.equal(tight.moduleDots, 8);
+  assert.equal(tight.grown, false);
+  assert.equal(tight.modules, 14);
   assert.throws(() => zpl.layoutTempLabel('5698-T-01', { ...settings.DEFAULT_LAYOUT, widthMm: 10, heightMm: 5 }), /too small/);
 });
 
@@ -688,6 +774,14 @@ test('settings: station rows validated, layout range-checked, round trip', () =>
 
   const notInstalled = settings.validateTempLabelSettings({ stations: TWO_STATIONS, layout: settings.DEFAULT_LAYOUT }, { installedPrinters: ['Zebra GK420D'] });
   assert.match(notInstalled.errors.join(' '), /"Zebra GK420D CNC" is not installed/);
+  // Saving checks the printer with the same exact comparison as printing.
+  const toshiba = [{ stationKey: 'door_cutting', enabled: true, printerName: 'TOSHIBA B-FV4 (203 dpi)' }];
+  const layout = settings.DEFAULT_LAYOUT;
+  assert.equal(settings.validateTempLabelSettings({ stations: toshiba, layout }, { installedPrinters: ['TSC TE210', 'TOSHIBA B-FV4 (203 dpi)'] }).ok, true);
+  assert.equal(settings.validateTempLabelSettings({ stations: toshiba, layout }, { installedPrinters: ['TOSHIBA B-FV4 (203 dpi)\r\n'] }).ok, true);
+  for (const others of [['TOSHIBA B-FV4 (203 dpi) (Copy 1)'], ['\\\\DESKTOP-5OHKE65.bjltd.local\\TOSHIBA B-FV4 (203 dpi)'], ['TOSHIBA B-FV4']]) {
+    assert.equal(settings.validateTempLabelSettings({ stations: toshiba, layout }, { installedPrinters: others }).ok, false, others[0]);
+  }
   const badLayout = settings.validateTempLabelSettings({ stations: [], layout: { widthMm: 0, heightMm: 'x', dpi: 150, moduleDots: 2.5, shiftXMm: 50, shiftYMm: 0 } });
   assert.equal(badLayout.errors.length, 5);
   assert.equal(settings.validateTempLabelSettings({ stations: [{ stationKey: 'nope', enabled: false }], layout: settings.DEFAULT_LAYOUT }).ok, false);

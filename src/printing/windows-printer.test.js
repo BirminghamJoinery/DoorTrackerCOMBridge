@@ -89,6 +89,15 @@ test('output that is not JSON is a clear error quoting what came back', () => {
   assert.throws(() => parsePrinterList('Get-CimInstance : Access denied'), /not JSON: Get-CimInstance : Access denied/);
 });
 
+test('a list whose main name source (InstalledPrinters) failed is marked incomplete', () => {
+  assert.equal(parsePrinterList('{"printers":[{"name":"TOSHIBA B-FV4 (203 dpi)"}],"details":"ok","namesOk":true,"warnings":[]}').complete, true);
+  const partial = parsePrinterList('{"printers":[],"details":"timeout","namesOk":false,"warnings":["Printer names (InstalledPrinters): RPC server unavailable"]}');
+  assert.equal(partial.complete, false);
+  assert.deepEqual(partial.printers, []);
+  assert.equal(parsePrinterList('[{"Name":"A"}]').complete, true, 'older shapes are read as before');
+  assert.equal(parsePrinterList('\r\n{"printers":[{"name":"TOSHIBA B-FV4 (203 dpi)"}],"namesOk":true}\r\n').printers[0].name, 'TOSHIBA B-FV4 (203 dpi)');
+});
+
 // ---- describePowerShellFailure ----
 
 test('a timeout says so - not just "Command failed"', () => {

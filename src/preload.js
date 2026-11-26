@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('tempLabels', {
   generateKey: () => ipcRenderer.invoke('generate-temp-label-key'),
   refresh: () => ipcRenderer.invoke('refresh-temp-label-data'),
   printTest: (stationKey, code) => ipcRenderer.invoke('print-temp-test-label', { stationKey, code }),
+  checkPrinter: (printerName) => ipcRenderer.invoke('check-temp-label-printer', printerName),
 
   onSourceStatus: (callback) => {
     ipcRenderer.on('temp-label-source-status', (event, status) => callback(status));

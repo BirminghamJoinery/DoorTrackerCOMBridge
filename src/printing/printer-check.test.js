@@ -81,6 +81,57 @@ test('a missing printer is reported as not found', async () => {
   assert.equal(r.found, false);
 });
 
+// The upstairs test laptop's lists, from its COM Bridge log (2026-11-26):
+// with the USB queue (09:26:24), and while it had been removed (09:18:15).
+const TOSHIBA = 'TOSHIBA B-FV4 (203 dpi)';
+const UNC_TOSHIBA = '\\\\DESKTOP-5OHKE65.bjltd.local\\TOSHIBA B-FV4 (203 dpi)';
+const LAPTOP_NOW = [TOSHIBA, 'ZDesigner GK420d', 'TSC TE210 #2', 'TSC TE210', 'SHARP MX-4060N (7800736500)', 'SHARP MX-3050N PCL6', 'OneNote (Desktop)', 'Microsoft Print to PDF', UNC_TOSHIBA];
+const LAPTOP_0918 = LAPTOP_NOW.filter((n) => n !== TOSHIBA);
+// What the current script prints (compact JSON, one line).
+const scriptOutput = (names, extra = {}) => JSON.stringify({ names, namesOk: true, keyFound: false, details: 'ok', isOffline: false, printerStatus: 3, extendedStatus: 2, namesMs: 45, detailsMs: 250, warnings: [], ...extra });
+
+test('regression: "TOSHIBA B-FV4 (203 dpi)" is found in the list Windows returns, and the comparison is reported', async () => {
+  const r = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput(LAPTOP_NOW, { keyFound: true }) });
+  assert.equal(r.found, true);
+  assert.equal(r.foundBy, 'InstalledPrinters');
+  assert.equal(r.nameMatch.how, 'exact');
+  assert.equal(r.nameMatch.name, TOSHIBA);
+  assert.equal(r.requested, TOSHIBA);
+  assert.deepEqual(r.installedNames, LAPTOP_NOW);
+  assert.equal(r.offline || r.statusOffline, false);
+});
+
+test('the script output may carry a BOM, CR/LF or a stray line around the JSON - still found', async () => {
+  for (const wrap of [
+    (j) => `﻿${j}\r\n`,
+    (j) => `\r\n${j}\r\n\r\n`,
+    (j) => `WARNING: something unrelated\r\n${j}`,
+    (j) => `${j}\r\nPS> `
+  ]) {
+    const r = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => wrap(scriptOutput(LAPTOP_NOW)) });
+    assert.equal(r.found, true);
+  }
+  // Each listed name with an artefact of its own: still exactly this printer.
+  const r = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput([`${TOSHIBA}\r\n`, 'TSC TE210']) });
+  assert.equal(r.found, true);
+  assert.equal(r.nameMatch.cleaned, true);
+  // One printer only: ConvertTo-Json still gives an array, but a bare string is read too.
+  assert.equal((await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput(TOSHIBA) })).found, true);
+});
+
+test('not in the list: not found, unless Win32_Printer has exactly that name; look-alikes are never used', async () => {
+  const missing = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput(LAPTOP_0918, { details: 'not-found', printerStatus: null, extendedStatus: null }) });
+  assert.equal(missing.found, false);
+  assert.deepEqual(missing.nameMatch.similar, [UNC_TOSHIBA]);
+  const byKey = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput(LAPTOP_0918, { keyFound: true }) });
+  assert.equal(byKey.found, true);
+  assert.equal(byKey.foundBy, 'Win32_Printer');
+  for (const other of ['TOSHIBA B-FV4 (203 dpi) (Copy 1)', 'TOSHIBA B-FV4', 'TOSHIBA B-FV4 (300 dpi)']) {
+    const r = await checkPrinterForPrinting(TOSHIBA, { platform: 'win32', run: async () => scriptOutput([other]) });
+    assert.equal(r.found, false, other);
+  }
+});
+
 test('off Windows, or with no name, PowerShell is never run', async () => {
   const run = () => { throw new Error('must not run'); };
   assert.equal((await checkPrinterForPrinting('P', { platform: 'darwin', run })).supported, false);
@@ -109,6 +160,24 @@ test('Windows: real check - installed printers are found, a missing one is not, 
   for (const name of [MISSING, ...AWKWARD_NAMES.filter((n) => !installed.includes(n))]) {
     const r = await checkPrinterForPrinting(name);
     assert.equal(r.found, false, name);
+  }
+});
+
+test('Windows: real Windows PowerShell 5.1 output - every installed name is listed byte-for-byte and found exactly, including "TOSHIBA B-FV4 (203 dpi)" when installed', { skip: !IS_WINDOWS && 'Windows only', timeout: 180000 }, async (t) => {
+  const installed = (await listPrinters()).printers.map((p) => p.name);
+  if (installed.length === 0) { t.skip('no printers installed'); return; }
+  const r = await checkPrinterForPrinting(installed[0]);
+  assert.ok(Array.isArray(r.installedNames));
+  for (const n of r.installedNames) {
+    assert.ok(installed.includes(n), `discovery lists the same name: ${JSON.stringify(n)}`);
+    assert.equal(n, n.trim(), `no padding/CR/LF: ${JSON.stringify(n)}`);
+  }
+  assert.equal(r.nameMatch.how, 'exact');
+  if (installed.includes(TOSHIBA)) {
+    const toshiba = await checkPrinterForPrinting(TOSHIBA);
+    assert.equal(toshiba.found, true);
+    assert.equal(toshiba.foundBy, 'InstalledPrinters');
+    assert.equal(toshiba.nameMatch.how, 'exact');
   }
 });
 

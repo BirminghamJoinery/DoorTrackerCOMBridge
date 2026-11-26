@@ -17,6 +17,7 @@ const { PrintJobProcessor } = require('./print-job-processor');
 const { createPrintAttemptStore } = require('./print-attempt-store');
 const printerSettings = require('./printer-settings');
 const windowsPrinter = require('./printing/windows-printer');
+const { describePrinterNameCheck, showPrinterName } = require('./printing/printer-names');
 const { buildTestPatternZpl } = require('./printing/zpl-image');
 const deliveryPhotosConfig = require('./delivery-photos/config');
 const { runInWorker: runDeliveryPhotosWorkerOp } = require('./delivery-photos/worker-runner');
@@ -680,7 +681,8 @@ async function discoverPrinters(reason) {
     const how = result.method === 'temp-file' ? 'temporary .ps1 fallback' : 'inline PowerShell';
     const names = result.printers.map((p) => p.name).join(', ');
     const warnings = result.warnings && result.warnings.length ? ` Warnings: ${result.warnings.join(' | ')}` : '';
-    comLogger.info(`Printer discovery found ${result.printers.length} printer(s) in ${result.elapsedMs}ms (${how})${names ? `: ${names.slice(0, 600)}` : ''}.${warnings}`);
+    const partial = result.complete === false ? ' The main printer-name list (InstalledPrinters) could not be read, so this list may be incomplete.' : '';
+    comLogger.info(`Printer discovery found ${result.printers.length} printer(s) in ${result.elapsedMs}ms (${how})${names ? `: ${names.slice(0, 600)}` : ''}.${warnings}${partial}`);
     return result;
   } catch (err) {
     const diagnostics = err.diagnostics ? ` Diagnostics: ${JSON.stringify(err.diagnostics)}` : '';
@@ -783,16 +785,40 @@ ipcMain.handle('save-temp-label-stations', async (event, stations) => {
   if (listed.error) {
     return { ok: false, errors: [`Could not read the installed printers: ${listed.error}`] };
   }
-  if (listed.supported) installedPrinters = listed.printers.map((p) => p.name);
+  // Only a complete list can refuse a printer for not being in it.
+  if (listed.supported && listed.complete !== false) installedPrinters = listed.printers.map((p) => p.name);
   let result;
   try {
     result = tempLabelSettings.saveTempLabelSettings(TEMP_LABEL_SETTINGS_PATH(), { stations, layout: loadTempLabelSettings().layout }, { installedPrinters });
   } catch (err) {
-    return { ok: false, errors: [`Could not save: ${err.message}`] };
+    return { ok: false, errors: [`Could not save: ${err.message}`], printers: listed };
   }
-  if (!result.ok) return result;
+  // The fresh printer list goes back too, so the window's "not found on
+  // this PC" marks are judged against the printers Windows has NOW, not the
+  // list it read when it opened.
+  if (!result.ok) return { ...result, printers: listed };
   comLogger.info(`Temporary Data Matrix Printing stations saved on this PC - ${describeTempLabelStations(result.settings.stations)}.`);
-  return { ok: true, settings: result.settings };
+  return { ok: true, settings: result.settings, printers: listed };
+});
+
+// The window asks this before marking a station's saved printer "not found
+// on this PC": the same exact-name check a print uses, run now. Logs the
+// requested name, the names Windows listed and the comparison result.
+// Resolves { known, found }; never rejects.
+ipcMain.handle('check-temp-label-printer', async (event, printerName) => {
+  const name = typeof printerName === 'string' ? printerName.slice(0, 300) : '';
+  try {
+    const check = await windowsPrinter.checkPrinterForPrinting(name);
+    if (!check.supported) return { known: false, found: false };
+    const how = describePrinterNameCheck(check) || `found ${check.found}`;
+    const line = `Temporary Data Matrix station printer check (window) - ${check.found ? 'found' : 'NOT found'}${check.foundBy ? ` via ${check.foundBy}` : ''} in ${check.elapsedMs}ms: ${how}.`;
+    if (check.found) comLogger.info(line);
+    else comLogger.warn(line);
+    return { known: true, found: check.found };
+  } catch (err) {
+    comLogger.warn(`Temporary Data Matrix station printer check (window) for ${showPrinterName(name)} could not run: ${err.message}`);
+    return { known: false, found: false };
+  }
 });
 
 ipcMain.handle('save-temp-label-layout', async (event, layout) => {

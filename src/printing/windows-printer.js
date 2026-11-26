@@ -29,6 +29,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { matchPrinterName } = require('./printer-names');
 
 const IS_WINDOWS = process.platform === 'win32';
 const POWERSHELL_TIMEOUT_MS = 15000;
@@ -49,6 +50,29 @@ function decodeClixml(text) {
 }
 
 const clip = (text, max = 2000) => (text.length > max ? `${text.slice(0, max)}...` : text);
+
+// The JSON one of these scripts printed. Our scripts write only compact JSON
+// ([Console]::Out.Write, UTF-8 without BOM), but a BOM, surrounding
+// whitespace/CR-LF, or a stray line written by something else before or
+// after it is tolerated: if the whole text is not JSON, the outermost {...}
+// in it is tried. Anything else is a clear error naming `what`.
+function parseJsonOutput(stdout, what) {
+  const text = String(stdout || '').replace(/^﻿/, '').trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        // fall through
+      }
+    }
+    throw new Error(`${what} returned output that is not JSON: ${clip(text, 300)}`);
+  }
+}
 
 // Turns a failed execFile() into an Error whose message says what actually
 // happened - timed out, exit code N, plus PowerShell's own stderr - instead
@@ -170,9 +194,11 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $warnings = New-Object System.Collections.Generic.List[string]
 $names = New-Object System.Collections.Generic.List[string]
+$namesOk = $false
 try {
   Add-Type -AssemblyName System.Drawing
   foreach ($n in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) { $names.Add([string]$n) }
+  $namesOk = $true
 } catch {
   $warnings.Add('Printer names (InstalledPrinters): ' + $_.Exception.Message)
 }
@@ -199,7 +225,7 @@ foreach ($n in $names) {
   $d = $details[$n]
   $printers.Add([ordered]@{ name = $n; isDefault = [bool]($d -and $d.Default); isOffline = [bool]($d -and $d.WorkOffline) })
 }
-$result = [ordered]@{ printers = $printers.ToArray(); details = $detailsState; warnings = $warnings.ToArray() }
+$result = [ordered]@{ printers = $printers.ToArray(); details = $detailsState; namesOk = $namesOk; warnings = $warnings.ToArray() }
 # UTF-8 (no BOM), not the console's OEM code page - so a printer name with
 # accented or other non-ASCII characters reaches Node exactly as Windows has it.
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
@@ -214,15 +240,15 @@ $result = [ordered]@{ printers = $printers.ToArray(); details = $detailsState; w
 // shape ({ Name, Default, WorkOffline }, bare object or array) so either
 // form reads the same. Names are kept exactly as Windows reports them -
 // spaces, punctuation, "\\server\share" connections and all.
+//
+// `complete` is false when the main name list (InstalledPrinters) could not
+// be read, so what was listed may be missing printers that do exist - the
+// window then never calls a saved printer "not found" from it, and saving
+// does not refuse a printer because it is absent from it.
 function parsePrinterList(stdout) {
   const text = (stdout || '').replace(/^\uFEFF/, '').trim();
-  if (!text) return { printers: [], warnings: [], details: 'ok' };
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error(`Printer discovery returned output that is not JSON: ${clip(text, 300)}`);
-  }
+  if (!text) return { printers: [], warnings: [], details: 'ok', complete: true };
+  const parsed = parseJsonOutput(text, 'Printer discovery');
   const isEnvelope = parsed && !Array.isArray(parsed) && typeof parsed === 'object' && 'printers' in parsed;
   const raw = isEnvelope ? parsed.printers : parsed;
   // ConvertTo-Json returns a bare object (not a 1-element array) when
@@ -239,7 +265,12 @@ function parsePrinterList(stdout) {
     printers.push({ name, isDefault: !!(p.isDefault ?? p.Default), isOffline: !!(p.isOffline ?? p.WorkOffline) });
   }
   const warnings = isEnvelope && parsed.warnings != null ? [].concat(parsed.warnings).map(String) : [];
-  return { printers, warnings, details: isEnvelope && parsed.details ? String(parsed.details) : 'ok' };
+  return {
+    printers,
+    warnings,
+    details: isEnvelope && parsed.details ? String(parsed.details) : 'ok',
+    complete: !(isEnvelope && parsed.namesOk === false)
+  };
 }
 
 // Returns { supported: false } on any non-Windows platform. On Windows,
@@ -333,7 +364,12 @@ async function getPrinterStatus(printerName) {
 //   1. Does a printer with EXACTLY this name exist? - PrinterSettings.
 //      InstalledPrinters (EnumPrinters level 4: the spooler's own list, no
 //      driver and no remote server involved), the same fast source as
-//      printer discovery.
+//      printer discovery. The script returns the whole list as JSON and the
+//      name is compared HERE, by printer-names.js's matchPrinterName (exact,
+//      after removing only output artefacts at the ends of a name), so the
+//      comparison is tested and the log can show both sides of it. If the
+//      name is not in that list, a Win32_Printer instance found under exactly
+//      this name (step 2) still counts as found.
 //   2. Is it offline? - Win32_Printer for that ONE printer (a key lookup,
 //      not a query over every printer), on its own runspace with a fixed
 //      wait. If it does not answer in time, the result says so
@@ -349,13 +385,12 @@ $ProgressPreference = 'SilentlyContinue'
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__NAME_B64__'))
 $warnings = New-Object System.Collections.Generic.List[string]
-$found = $false
-$foundBy = $null
+$names = New-Object System.Collections.Generic.List[string]
+$namesOk = $false
 try {
   Add-Type -AssemblyName System.Drawing
-  foreach ($n in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) {
-    if ([string]$n -eq $name) { $found = $true; $foundBy = 'InstalledPrinters'; break }
-  }
+  foreach ($n in [System.Drawing.Printing.PrinterSettings]::InstalledPrinters) { $names.Add([string]$n) }
+  $namesOk = $true
 } catch {
   $warnings.Add('Printer names (InstalledPrinters): ' + $_.Exception.Message)
 }
@@ -388,10 +423,10 @@ try {
   $details = 'failed'
   $warnings.Add('Printer status (Win32_Printer): ' + $_.Exception.Message)
 }
-if (-not $found -and $null -ne $p) { $found = $true; $foundBy = 'Win32_Printer' }
 $result = [ordered]@{
-  found = $found
-  foundBy = $foundBy
+  names = $names.ToArray()
+  namesOk = $namesOk
+  keyFound = ($null -ne $p)
   details = $details
   isOffline = [bool]($p -and $p.WorkOffline)
   printerStatus = $(if ($p) { [int]$p.PrinterStatus } else { $null })
@@ -415,7 +450,9 @@ function buildPrinterCheckScript(printerName) {
 // Returns { supported: false, ... } off-Windows. On Windows:
 //   { supported: true, found, foundBy, details: 'ok'|'not-found'|'timeout'|'failed',
 //     offline, statusOffline, printerStatus, extendedStatus, warnings,
-//     namesMs, detailsMs, elapsedMs }
+//     namesMs, detailsMs, elapsedMs,
+//     requested, installedNames, namesOk, nameMatch, keyFound }
+// (`installedNames`/`nameMatch` are what describePrinterNameCheck logs.)
 // `offline`/`statusOffline` mean the same as in getPrinterStatus(), and are
 // only meaningful when details === 'ok'. Rejects (with err.diagnostics) only
 // when PowerShell itself fails or exceeds PRINTER_CHECK_TIMEOUT_MS.
@@ -431,17 +468,35 @@ async function checkPrinterForPrinting(printerName, deps = {}) {
   const run = deps.run || ((script) => runPowerShellCommand(script, { timeoutMs: PRINTER_CHECK_TIMEOUT_MS }));
   const started = Date.now();
   const stdout = await run(buildPrinterCheckScript(printerName));
-  let parsed;
-  try {
-    parsed = JSON.parse((stdout || '').replace(/^\uFEFF/, '').trim());
-  } catch {
-    throw new Error(`Printer check returned output that is not JSON: ${clip(String(stdout || ''), 300)}`);
-  }
+  const parsed = parseJsonOutput(stdout, 'Printer check');
   const details = ['ok', 'not-found', 'timeout', 'failed'].includes(parsed.details) ? parsed.details : 'failed';
+
+  // Current script: the names Windows listed, compared here. (An older
+  // script shape that compared inside PowerShell - `found`/`foundBy` - is
+  // still read the same way.)
+  let found;
+  let foundBy;
+  let installedNames = null;
+  let nameMatch = null;
+  const keyFound = parsed.keyFound === true;
+  if (Array.isArray(parsed.names) || typeof parsed.names === 'string') {
+    installedNames = [].concat(parsed.names).map(String);
+    nameMatch = matchPrinterName(printerName, installedNames);
+    found = nameMatch.found || keyFound;
+    foundBy = nameMatch.found ? 'InstalledPrinters' : keyFound ? 'Win32_Printer' : null;
+  } else {
+    found = !!parsed.found;
+    foundBy = parsed.foundBy || null;
+  }
   return {
     supported: true,
-    found: !!parsed.found,
-    foundBy: parsed.foundBy || null,
+    found,
+    foundBy,
+    requested: printerName,
+    installedNames,
+    namesOk: parsed.namesOk !== false,
+    nameMatch,
+    keyFound,
     details,
     offline: details === 'ok' && !!parsed.isOffline,
     statusOffline: details === 'ok' && (parsed.printerStatus === 7 || parsed.extendedStatus === 7),

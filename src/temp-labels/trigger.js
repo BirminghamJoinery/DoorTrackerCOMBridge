@@ -15,6 +15,7 @@
 
 const { parseTempLabelTrigger, generateTempCodes, describeCodeRange, normalizeTestCode } = require('./codes');
 const { buildTempBatchZpl } = require('./zpl');
+const { describePrinterNameCheck } = require('../printing/printer-names');
 
 const DEFAULT_SUPPRESSION_MS = 45 * 1000;
 
@@ -221,6 +222,11 @@ function createTempLabelTrigger(deps) {
       printer = { ok: false, reason: errorText(err), error: err };
     }
     const checkMs = printer && typeof printer.ms === 'number' ? printer.ms : now() - began;
+    const nameCheck = describePrinterNameCheck(printer && printer.status);
+    if (nameCheck) {
+      const level = printer.status.found ? 'info' : 'warn';
+      logger[level](`${stage} - step 1/3 printer name comparison: ${nameCheck}.`);
+    }
     if (!printer || !printer.ok) {
       const reason = (printer && printer.reason) || 'Printer unavailable';
       logger.warn(`${stage} - step 1/3 printer check refused after ${checkMs}ms: ${reason}${describeCheck(printer)}`);

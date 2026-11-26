@@ -12,7 +12,7 @@ const nodePath = require('node:path');
 
 const settings = require('./settings');
 const { createTempLabelTrigger, createPrinterCheck } = require('./trigger');
-const { describePowerShellFailure } = require('../printing/windows-printer');
+const { describePowerShellFailure, checkPrinterForPrinting } = require('../printing/windows-printer');
 
 const PRINTER = 'TOSHIBA B-FV4D';
 
@@ -171,6 +171,38 @@ test('a PowerShell timeout in the status check is logged with its diagnostics, a
   const h = harness({ getStatus: async () => { throw powerShellTimeout({ timeoutMs: 10000 }); } });
   assert.equal((await printTest(h)).ok, true);
   assert.match(h.logger.text(), /WARN .* step 1\/3 printer check incomplete after \d+ms: Printer status could not be checked \(PowerShell did not finish within 10s and was stopped\) - sending anyway.* \[command: powershell\.exe .*; stopped by the time limit; PowerShell ran 10012ms\]/);
+});
+
+test('regression: "TOSHIBA B-FV4 (203 dpi)" listed by Windows is found and printed to; the log shows requested name, installed names and the result', async () => {
+  const toshiba = 'TOSHIBA B-FV4 (203 dpi)';
+  const listed = [toshiba, 'ZDesigner GK420d', 'TSC TE210 #2', 'Microsoft Print to PDF'];
+  const h = harness({
+    getStatus: (name) => checkPrinterForPrinting(name, {
+      platform: 'win32',
+      run: async () => `${JSON.stringify({ names: listed, namesOk: true, keyFound: true, details: 'ok', isOffline: false, printerStatus: 3, extendedStatus: 2, namesMs: 40, detailsMs: 200, warnings: [] })}\r\n`
+    })
+  });
+  const result = await h.trigger.printTestLabel({ printerName: toshiba, code: 'TEST-T-01', stationKey: 'door_cutting' });
+  assert.deepEqual(result, { ok: true, code: 'TEST-T-01' });
+  assert.deepEqual(h.sent.map((s) => s.printerName), [toshiba]);
+  assert.match(h.logger.text(), /INFO .* step 1\/3 printer name comparison: requested "TOSHIBA B-FV4 \(203 dpi\)"; installed printers from InstalledPrinters \(4\): "TOSHIBA B-FV4 \(203 dpi\)", "ZDesigner GK420d", "TSC TE210 #2", "Microsoft Print to PDF"; result: exact match\./);
+  assert.match(h.logger.text(), /step 1\/3 printer check passed in \d+ms \(found via InstalledPrinters, status ok/);
+});
+
+test('a printer really missing from Windows\' list is refused, and the log shows what Windows listed instead', async () => {
+  const toshiba = 'TOSHIBA B-FV4 (203 dpi)';
+  const listed = ['ZDesigner GK420d', '\\\\DESKTOP-5OHKE65.bjltd.local\\TOSHIBA B-FV4 (203 dpi)', 'TOSHIBA B-FV4 (203 dpi) (Copy 1)'];
+  const h = harness({
+    getStatus: (name) => checkPrinterForPrinting(name, {
+      platform: 'win32',
+      run: async () => JSON.stringify({ names: listed, namesOk: true, keyFound: false, details: 'not-found', isOffline: false, printerStatus: null, extendedStatus: null, namesMs: 40, detailsMs: 100, warnings: [] })
+    })
+  });
+  const result = await h.trigger.printTestLabel({ printerName: toshiba, code: 'TEST-T-01', stationKey: 'door_cutting' });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /"TOSHIBA B-FV4 \(203 dpi\)" was not found on this PC/);
+  assert.equal(h.sent.length, 0, 'never the copy or the network connection instead');
+  assert.match(h.logger.text(), /WARN .* step 1\/3 printer name comparison: requested "TOSHIBA B-FV4 \(203 dpi\)"; installed printers from InstalledPrinters \(3\): .*; result: no printer with exactly this name \(similar names, NOT used: .*"TOSHIBA B-FV4 \(203 dpi\) \(Copy 1\)"\); Win32_Printer lookup by this exact name: not found\./);
 });
 
 test('a successful print logs every stage, in order, with timings from inside PowerShell', async () => {

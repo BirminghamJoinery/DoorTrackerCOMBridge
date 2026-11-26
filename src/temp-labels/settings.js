@@ -18,6 +18,7 @@ const fs = require('node:fs');
 const nodePath = require('node:path');
 const { isStationKey, STATIONS } = require('../com-options');
 const { LABEL_SHIFT_X_MM, LABEL_SHIFT_Y_MM } = require('../printing/zpl-image');
+const { matchPrinterName } = require('../printing/printer-names');
 
 // Starting point only - adjust in the app after the first physical test.
 // Size and offsets are the ones the GK420D is already set up and calibrated
@@ -80,7 +81,7 @@ function validateStations(list, { installedPrinters } = {}) {
       errors.push(`Choose a printer for "${stationName(stationKey)}" before enabling it.`);
       continue;
     }
-    if (enabled && Array.isArray(installedPrinters) && !installedPrinters.includes(printerName)) {
+    if (enabled && Array.isArray(installedPrinters) && !matchPrinterName(printerName, installedPrinters).found) {
       errors.push(`Printer "${printerName}" is not installed on this PC - choose one from the list.`);
       continue;
     }

@@ -275,3 +275,98 @@ test('Refresh re-runs ONE discovery and recovers both dropdowns after a failure'
   assert.equal(state.printerListError, '');
   await app.page.close();
 });
+
+// Regression (upstairs test laptop, 2026-11-26): the station table said
+// "TOSHIBA B-FV4 (203 dpi) (not found on this PC)" while Windows listed that
+// exact printer. The table was judged against the printer list read when the
+// window opened (09:18, while the USB queue had been removed from Windows);
+// the queue came back at 09:26, and saving read the printers again, but the
+// window kept the old list. Now a saved printer missing from the window's
+// list is checked again (the exact-name check printing uses) first, and a
+// save hands the window the fresh list.
+const TOSHIBA = 'TOSHIBA B-FV4 (203 dpi)';
+const LIST_0918 = [
+  { name: 'ZDesigner GK420d', isDefault: false, isOffline: true },
+  { name: 'TSC TE210 #2', isDefault: false, isOffline: false },
+  { name: '\\DESKTOP-5OHKE65.bjltd.local\TOSHIBA B-FV4 (203 dpi)', isDefault: false, isOffline: false }
+];
+const toshibaSettings = () => {
+  const s = baseResponses()['tempLabels.getSettings'];
+  return { ...s, settings: { ...s.settings, stations: [{ stationKey: 'door_cutting', enabled: false, printerName: TOSHIBA }] } };
+};
+const waitForRow = (app, re) => app.page.waitForFunction((src) => new RegExp(src).test(document.getElementById('temp-label-body').textContent), re.source);
+
+test('"TOSHIBA B-FV4 (203 dpi)" missing from the start-up list but present in Windows now: NOT marked "not found"', async (t) => {
+  const app = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: LIST_0918, warnings: [], details: 'ok', complete: true },
+    'tempLabels.getSettings': toshibaSettings(),
+    'tempLabels.checkPrinter': { known: true, found: true }
+  });
+  if (!app) return;
+  await app.page.waitForFunction(() => window.__calls.includes('tempLabels.checkPrinter'));
+  await waitForRow(app, /TOSHIBA B-FV4 \(203 dpi\)(?! \(checking)/);
+  const rows = (await app.read()).ruleRows;
+  assert.match(rows, /TOSHIBA B-FV4 \(203 dpi\)/);
+  assert.doesNotMatch(rows, /not found on this PC|checking/);
+  await app.page.close();
+});
+
+test('a saved printer the exact check also cannot find IS marked "not found on this PC"', async (t) => {
+  const app = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: LIST_0918, warnings: [], details: 'ok', complete: true },
+    'tempLabels.getSettings': toshibaSettings(),
+    'tempLabels.checkPrinter': { known: true, found: false }
+  });
+  if (!app) return;
+  await waitForRow(app, /TOSHIBA B-FV4 \(203 dpi\) \(not found on this PC\)/);
+  await app.page.close();
+});
+
+test('a printer in the list is not re-checked; an incomplete list or an unanswered check never claims "not found"', async (t) => {
+  const inList = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: [{ name: TOSHIBA, isDefault: false, isOffline: false }], warnings: [], details: 'ok', complete: true },
+    'tempLabels.getSettings': toshibaSettings()
+  });
+  if (!inList) return;
+  assert.doesNotMatch((await inList.read()).ruleRows, /not found|checking/);
+  assert.equal(await inList.page.evaluate(() => window.__calls.filter((c) => c === 'tempLabels.checkPrinter').length), 0);
+  await inList.page.close();
+
+  const partial = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: [], warnings: ['Printer names (InstalledPrinters): RPC server unavailable'], details: 'timeout', complete: false },
+    'tempLabels.getSettings': toshibaSettings()
+  });
+  assert.doesNotMatch((await partial.read()).ruleRows, /not found|checking/);
+  await partial.page.close();
+
+  const unknown = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: LIST_0918, warnings: [], details: 'ok', complete: true },
+    'tempLabels.getSettings': toshibaSettings(),
+    'tempLabels.checkPrinter': { reject: 'PowerShell did not finish within 12s and was stopped' }
+  });
+  await waitForRow(unknown, /TOSHIBA B-FV4 \(203 dpi\)(?! \(checking)/);
+  assert.doesNotMatch((await unknown.read()).ruleRows, /not found/);
+  await unknown.page.close();
+});
+
+test('saving uses the printer list read while saving - a printer that has come back is offered and not marked missing', async (t) => {
+  const nowListed = [{ name: TOSHIBA, isDefault: false, isOffline: false }, ...LIST_0918];
+  const app = await openApp(t, {
+    'comBridge.listPrinters': { supported: true, printers: LIST_0918, warnings: [], details: 'ok', complete: true },
+    'tempLabels.getSettings': toshibaSettings(),
+    'tempLabels.checkPrinter': { known: true, found: false },
+    'tempLabels.saveStations': {
+      ok: true,
+      settings: { stations: [{ stationKey: 'door_cutting', enabled: true, printerName: TOSHIBA }], layout: DEFAULT_LAYOUT },
+      printers: { supported: true, printers: nowListed, warnings: [], details: 'ok', complete: true }
+    }
+  });
+  if (!app) return;
+  await waitForRow(app, /\(not found on this PC\)/);
+  await app.page.click('#temp-label-save-btn');
+  await waitForRow(app, /Enabled/);
+  const state = await app.read();
+  assert.doesNotMatch(state.ruleRows, /not found on this PC/);
+  assert.ok(state.tempPrinterOptions.some((o) => o.value === TOSHIBA), 'the fresh list fills the dropdown');
+  await app.page.close();
+});

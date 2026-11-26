@@ -128,7 +128,10 @@ When a scanner at an enabled station scans an order's general door code -
 exactly `-D`) - the station's own USB printer prints that order's
 **temporary labels**: one centred Data Matrix per label, encoding exactly
 `5698-T-01`, `5698-T-02`, ... (`5626-2-T-01`, ... for a call-off) and nothing
-else. Numbers are two digits up to 99, then `100`, `101`, ... Individual door
+else, with that same full code (`5698-T-01`, ...) printed as plain text
+above it. The symbol is
+printed one ECC200 size larger than the code needs (16x16 instead of 14x14 at
+the default 1mm modules: 16mm instead of 14mm). Numbers are two digits up to 99, then `100`, `101`, ... Individual door
 codes (`5698-D-01`), frame (`-F`), delivery (`-DELIV`) and temporary (`-T-01`)
 codes never trigger it. The scan is still sent to the website exactly as
 before; printing is an extra action that never blocks or fails it.

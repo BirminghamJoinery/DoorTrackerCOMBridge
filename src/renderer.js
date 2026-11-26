@@ -872,6 +872,35 @@ reprintTestBtn.addEventListener('click', async () => {
 // failed) - the station table then never claims a saved printer is missing.
 let installedPrinterNames = null;
 
+// The list above is a snapshot - read when the window opened, on Refresh,
+// or when stations are saved. A printer plugged in, re-added or renamed in
+// Windows after that is not in it. So a saved printer that is missing from
+// the snapshot is checked again, by the same exact-name check a print uses
+// (main.js 'check-temp-label-printer', which also logs the comparison),
+// before the table calls it "not found on this PC".
+// name -> 'checking' | 'found' | 'missing' | 'unknown'; cleared with every
+// new snapshot.
+const tempPrinterPresence = new Map();
+
+function tempPrinterMissingNote(printerName) {
+  if (!installedPrinterNames || !printerName || installedPrinterNames.includes(printerName)) return '';
+  const state = tempPrinterPresence.get(printerName);
+  if (state === undefined) {
+    tempPrinterPresence.set(printerName, 'checking');
+    Promise.resolve()
+      .then(() => window.tempLabels.checkPrinter(printerName))
+      .then((r) => (r && r.known ? (r.found ? 'found' : 'missing') : 'unknown'), () => 'unknown')
+      .then((next) => {
+        if (tempPrinterPresence.get(printerName) !== 'checking') return; // a newer snapshot replaced it
+        tempPrinterPresence.set(printerName, next);
+        renderTempLabelTable();
+      });
+    return ' (checking...)';
+  }
+  if (state === 'checking') return ' (checking...)';
+  return state === 'missing' ? ' (not found on this PC)' : '';
+}
+
 // ---- Temporary Data Matrix Printing ----
 // Per-STATION rule (enabled + printer), the label layout, the source cache
 // status and a one-label test print - see temp-labels/ and main.js's section
@@ -1017,9 +1046,9 @@ function renderTempLabelTable() {
     badge.textContent = rule.enabled ? 'Enabled' : 'Disabled';
     statusCell.appendChild(badge);
     const printerCell = document.createElement('td');
-    const missing = installedPrinterNames && rule.printerName && !installedPrinterNames.includes(rule.printerName);
-    printerCell.textContent = rule.printerName ? `${rule.printerName}${missing ? ' (not found on this PC)' : ''}` : '-';
-    if (missing) printerCell.className = 'failed';
+    const note = tempPrinterMissingNote(rule.printerName);
+    printerCell.textContent = rule.printerName ? `${rule.printerName}${note}` : '-';
+    if (note === ' (not found on this PC)') printerCell.className = 'failed';
     const lastCell = document.createElement('td');
     const outcome = tempLabelLastOutcome.get(rule.stationKey);
     lastCell.textContent = outcome ? describeTempLabelOutcome(outcome) : '-';
@@ -1086,7 +1115,10 @@ function showErrors(el, errors) {
 // Returns a short description for the start-up log.
 function renderTempLabelPrinters(result) {
   const failed = Boolean(result.error);
-  installedPrinterNames = result.supported && !failed ? result.printers.map((p) => p.name) : null;
+  // A list whose main name source failed (complete: false) may be missing
+  // printers that exist - it is shown, but never used to call one missing.
+  installedPrinterNames = result.supported && !failed && result.complete !== false ? result.printers.map((p) => p.name) : null;
+  tempPrinterPresence.clear();
   showPrinterDiscoveryError(tl.printerError, result.error);
   tl.printer.innerHTML = '';
   const placeholder = document.createElement('option');
@@ -1115,6 +1147,12 @@ async function saveTempLabelStations(stations) {
   showErrors(tl.error, null);
   tempLabelSettings = result.settings;
   flashSaved(tl.saved);
+  // Saving read the printers again - use that list from now on, so the
+  // dropdown and the "not found" marks show what Windows has now.
+  if (result.printers && Array.isArray(result.printers.printers)) {
+    renderTempLabelPrinters(result.printers);
+    return;
+  }
   showTempLabelRuleInEditor();
   renderTempLabelTable();
 }

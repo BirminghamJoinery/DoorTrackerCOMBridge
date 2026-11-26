@@ -103,7 +103,11 @@ jobs:
       # assets under the exact names the updater looks for, latest.yml whose
       # SHA-512 really matches the installer, app-update.yml, and the updater,
       # Remote Admin (with its web page) and electron-updater inside app.asar.
-      - name: Verify updater and Remote Admin files are really in the package
+      # Also every Electron runtime file the exe needs to start (ffmpeg.dll,
+      # libEGL.dll, libGLESv2.dll, icudtl.dat, the .pak files, ...), checked
+      # against node_modules/electron/dist in win-unpacked AND inside the
+      # Setup and Portable exes - a package missing one fails the build here.
+      - name: Verify updater, Remote Admin and Electron runtime files are really in the package
         run: node scripts/verify-package.js
 
       # Just the files a GitHub Release carries, for the release job below.
